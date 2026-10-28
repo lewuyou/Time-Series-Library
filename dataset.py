@@ -98,11 +98,12 @@ infer 模式的历史快照一致性：
     #       也可直接调用 ds.to_simple_return(prediction)。
 
 训练脚本：
-    train_timexer.py 提供 TimeXer 的独立训练循环（features="MS"、
-    pred_len=1、label_len=0、每轮只看验证集、最后一次性评估测试集并对比
-    零预测/训练期均值/持续性基准）。注意 TimeXer 内生分支用不重叠 patch：
+    共享训练使用 train_global_timexer.py（独立窗口、联合训练），
+    不依赖本模块，只读导出文件。注意 TimeXer 内生分支用不重叠 patch：
     patch_len 必须整除 seq_len，否则 60/16 会丢弃最近 12 天目标历史，
     训练脚本已内置该校验。
+    本模块底部的 StockTimeXerDataset 保留用于单股训练的独立训练循环
+    （features="MS"、pred_len=1、label_len=0，只读导出文件）。
 
 共享模型流程中的定位（完整流程见 export_global.py 头部说明）：
     1. select_universe.py 粗筛股票池；

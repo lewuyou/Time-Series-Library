@@ -91,15 +91,21 @@ def resolve_split(db, test_days, val_days):
     """返回 (as_of, train_end, val_end, test_start)。与 dataset.py 同源的交易日历。"""
     con = duckdb.connect(db, read_only=True)
     try:
-        calendar, _ = ds.load_calendar(con, None, None, 50)
-        as_of = pd.Timestamp(
-            con.execute(
-                "SELECT max(date) FROM akshare_tx WHERE adjust='hfq'"
-            ).fetchone()[0]
-        ).normalize()
+        calendar, _ = ds.load_calendar(
+            con, None, ds.DEFAULT_CALENDAR_START, 50
+        )
+        value = con.execute(
+            "SELECT max(date) FROM akshare_tx WHERE adjust='hfq'"
+        ).fetchone()[0]
+        if value is None:
+            raise ValueError("数据库没有后复权行情")
+        as_of = pd.Timestamp(value).normalize()
         if as_of not in calendar:
             raise ValueError(f"as-of {as_of.date()} 不在交易日历内")
+        if calendar.get_loc(as_of) + 1 >= len(calendar):
+            raise ValueError("交易日历缺少 as-of 之后的下一交易日")
         upto = calendar[calendar <= as_of]
+        # 全局日期的粗略下限检查；单股样本是否达标由 prepare_one() 判断。
         need = test_days + val_days + 300
         if len(upto) < need:
             raise ValueError(f"交易日不足：{len(upto)} < {need}")
@@ -115,7 +121,9 @@ def init_worker(db, data_root, as_of, train_end, val_end,
                 seq_len, min_train_samples, min_eval_samples):
     """进程级初始化：只读 duckdb 连接 + 交易日历 + 预处理配置。"""
     con = duckdb.connect(db, read_only=True)
-    calendar, calendar_info = ds.load_calendar(con, None, None, 50)
+    calendar, calendar_info = ds.load_calendar(
+        con, None, ds.DEFAULT_CALENDAR_START, 50
+    )
     policies = ds.load_policies(None)
     macro_fields = ["close", "volume"]
     config = {
@@ -138,7 +146,8 @@ def init_worker(db, data_root, as_of, train_end, val_end,
 
     args_ns = argparse.Namespace(
         mode="prepare", db=db, out_dir=str(data_root),
-        calendar=None, calendar_start=None, min_market_symbols=50,
+        calendar=None, calendar_start=ds.DEFAULT_CALENDAR_START,
+        min_market_symbols=50,
         symbol=None, industry=None, top=None, baidu_keyword=None,
         as_of=str(as_of.date()), start=None, tail=None,
         train_end=str(train_end.date()), val_end=str(val_end.date()),
@@ -153,7 +162,11 @@ def init_worker(db, data_root, as_of, train_end, val_end,
     )
     _G.update(con=con, calendar=calendar, calendar_info=calendar_info,
               config=config, macro_specs=macro_specs, args=args_ns,
-              as_of=as_of)
+              as_of=as_of,
+              # 日历指纹每进程只算一次，供 export_one 复用校验。
+              calendar_fingerprint=ds.calendar_fingerprint(
+                  calendar, as_of, calendar_info
+              ))
 
 
 def export_one(row):
@@ -180,6 +193,7 @@ def export_one(row):
             "samples.csv",
             "preprocessing.json",
             "dates.npy",
+            "manifest.json",
         ]
         for name in required:
             if not (root / name).exists():
@@ -189,14 +203,31 @@ def export_one(row):
             (root / "preprocessing.json").read_text(encoding="utf-8")
         )
 
+        # 复用已有目录前做完整口径校验：预处理配置（含百度关键词来源）、
+        # 日历指纹、数据截止日必须与本次任务一致，避免混用不同口径的导出。
         args = _G["args"]
+        expected_config = dict(_G["config"])
+        expected_config["baidu_keyword"] = (
+            expected_config.get("baidu_keyword") or str(row["name"])
+        )
+        expected_calendar = _G["calendar_fingerprint"]
         if (
-            prep["train_end"] != args.train_end
-            or prep["val_end"] != args.val_end
-            or prep["config"]["seq_len"] != args.seq_len
-            or prep["config"]["return_type"] != "simple"
+            prep.get("symbol") != symbol
+            or prep.get("version") != ds.VERSION
+            or prep.get("config") != expected_config
+            or prep.get("calendar") != expected_calendar
+            or prep.get("min_feature_coverage") != args.min_feature_coverage
+            or prep.get("min_observations") != args.min_observations
+            or prep.get("train_end") != args.train_end
+            or prep.get("val_end") != args.val_end
         ):
-            raise ValueError("已有导出的配置与本次任务不一致")
+            raise ValueError("已有导出的预处理配置或日历与本次任务不一致")
+
+        manifest = json.loads(
+            (root / "manifest.json").read_text(encoding="utf-8")
+        )
+        if manifest.get("as_of") != str(_G["as_of"].date()):
+            raise ValueError("已有导出的 as-of 与本次任务不一致")
 
         bases = [
             c for c in prep["feature_columns"]
@@ -226,6 +257,12 @@ def main():
         a.min_train_samples, a.min_eval_samples,
     ) < 1:
         raise ValueError("数量参数必须为正数")
+    if a.seq_len < 2:
+        raise ValueError("--seq-len 必须 >= 2")
+    if min(a.test_days, a.val_days) < a.min_eval_samples:
+        # 只是必要条件：停牌等情况仍可能导致单股有效样本不足，
+        # 最终由 prepare_one() 判断。
+        raise ValueError("test-days 和 val-days 不能小于 min-eval-samples")
 
     rows = pd.read_csv(
         a.universe_csv, dtype={"symbol": str}
@@ -245,6 +282,7 @@ def main():
     root.mkdir(parents=True, exist_ok=True)
 
     spec = {
+        "export_version": "global_export_v2",
         "db": str(Path(a.db).resolve()),
         "as_of": str(as_of.date()),
         "train_end": str(train_end.date()),
@@ -255,6 +293,18 @@ def main():
         "min_eval_samples": a.min_eval_samples,
         "symbols": sorted(symbols),
         "dataset_version": ds.VERSION,
+        "calendar_start": ds.DEFAULT_CALENDAR_START,
+        "min_market_symbols": 50,
+        "policies": ds.load_policies(None),
+        "macro_fields": ["close", "volume"],
+        "min_feature_coverage": 0.60,
+        "min_observations": 100,
+        "return_type": "simple",
+        "decision_hour": 8,
+        "decision_minute": 30,
+        "universe_sha256": ds.sha256_file(a.universe_csv),
+        "dataset_script_sha256": ds.sha256_file(ds.__file__),
+        "export_script_sha256": ds.sha256_file(__file__),
     }
 
     config_path = root / "export_config.json"
@@ -283,18 +333,36 @@ def main():
             a.min_eval_samples,
         ),
     ) as pool:
-        futures = [pool.submit(export_one, row) for row in rows]
+        futures = {
+            pool.submit(export_one, row): ds.norm_symbol(row["symbol"])
+            for row in rows
+        }
         for future in as_completed(futures):
-            result = future.result()
+            symbol = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                # worker 初始化失败、进程崩溃等异常会绕过 export_one
+                # 内部的 try，这里兜底记录，避免整个进程池静默失败。
+                result = {
+                    "symbol": symbol,
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
             results.append(result)
             print(result, flush=True)
 
-    report = pd.DataFrame(results)
-    report.to_csv(root / "export_results.csv", index=False)
+    report = pd.DataFrame(results).sort_values("symbol")
+    temporary = root / "export_results.tmp.csv"
+    report.to_csv(temporary, index=False)
+    temporary.replace(root / "export_results.csv")
     print(report["status"].value_counts().to_dict())
 
     if (report["status"] == "error").any():
-        print("存在导出错误；请查看 export_results.csv，修复后重跑。")
+        # filtered_* 是按设计排除，error 是处理失败，不能当作"不合格"。
+        raise SystemExit(
+            "存在导出错误；请查看 export_results.csv，修复后重跑"
+        )
 
 
 if __name__ == "__main__":

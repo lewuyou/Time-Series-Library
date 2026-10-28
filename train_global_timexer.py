@@ -38,12 +38,19 @@
        scaler，不能每次预测都用最新全量历史重新拟合。
     2. 全局样本索引只定位到某股票内部，绝不跨股票切片；可以混合不同
        股票的窗口组成 batch，但不能混接股票时间轴。
-    3. 每个 epoch 所有股票总权重相同（股票等权），避免大股票主导损失。
+    3. 每个 epoch 所有股票总权重相同（股票等权），避免训练窗口更多的
+       股票主导损失（控制的是样本数量而非市值大小；AdamW 与梯度裁剪
+       仍会影响实际参数更新）。
     4. 每轮只在验证集上早停；测试集仅在模型选定后评估一次。
     5. patch-len 必须整除 seq_len（TimeXer 内生分支用不重叠 patch）。
     6. 第一轮建议 --workers 0 便于定位数据问题；大量股票随机访问时
        磁盘、系统缓存与 DataLoader 进程开销可能成为瓶颈，不是 worker
        越多越快。
+    7. checkpoint 只保存最优模型（无优化器/随机数状态），不是训练恢复
+       文件；"断点续跑"仅指导出阶段（export_config.json），输出目录已有
+       checkpoint 时会直接拒绝训练。
+    8. predict 仅支持 checkpoint 中登记过的股票（每股训练期 scaler），
+       是"当前训练股票池共享一个模型"，不是任意新股票的零样本预测。
 
 已知局限（详见使用说明第九节）：
     1. "按假设发布时间对齐"不是真实 point-in-time：百度指数实际延迟、
@@ -117,6 +124,23 @@ def load_catalog(data_root):
     report = pd.read_csv(
         root / "export_results.csv", dtype={"symbol": str}
     )
+    required = {"symbol", "status"}
+    if not required.issubset(report.columns):
+        raise ValueError("export_results.csv 缺少必要字段（symbol/status）")
+    if report["symbol"].duplicated().any():
+        raise ValueError("export_results.csv 存在重复股票")
+    if (report["status"] == "error").any():
+        raise ValueError(
+            "导出报告仍有 error，请先修复导出，避免静默训练部分股票池"
+        )
+
+    # 与导出任务登记对比，确保时间边界与窗口长度和本次 data-root
+    # 一致，而不只是股票之间相互一致。
+    spec = read_json(root / "export_config.json")
+    for key in ("train_end", "val_end", "seq_len"):
+        if key not in spec:
+            raise ValueError(f"export_config.json 缺少字段 {key}")
+
     symbols = sorted(
         report.loc[report.status == "ok", "symbol"].unique().tolist()
     )
@@ -137,6 +161,12 @@ def load_catalog(data_root):
             raise ValueError(f"{symbol}: 特征列定义异常")
         if prep["config"]["return_type"] != "simple":
             raise ValueError("本脚本要求 simple 收益率，请重新导出")
+        if prep["train_end"] != spec["train_end"]:
+            raise ValueError(f"{symbol}: train_end 与导出任务登记不一致")
+        if prep["val_end"] != spec["val_end"]:
+            raise ValueError(f"{symbol}: val_end 与导出任务登记不一致")
+        if prep["config"]["seq_len"] != spec["seq_len"]:
+            raise ValueError(f"{symbol}: seq_len 与导出任务登记不一致")
 
         # baidu_keyword 本来就应该随股票不同，不纳入一致性比较。
         config = {

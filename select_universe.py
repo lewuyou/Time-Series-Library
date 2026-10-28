@@ -12,8 +12,9 @@
        且仍在更新（最新观测日距库内最新行情日不超过 --baidu-fresh-days）；
     3. 辅助数据里有两融数据：rzrq 表中存在该股票记录；
     4. 总数据量不小于 --min-years 年（默认 3 年）：后复权行情
-       跨度 >= 365*min-years 天 且 有效交易日数（count(DISTINCT date)）
-       >= 244*min-years 天。
+       跨度 >= 365*min-years 天 且 有行情记录的不同日期数量
+       （count(DISTINCT date)）>= 244*min-years 天。
+       SQL 未逐行验证 OHLC 是否有效，真正的行情有效性由 dataset.py 判断。
 
 说明：
     - 本脚本只是入库数据的粗筛（快速排除明显不合格的股票）；百度/两融
@@ -44,7 +45,9 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--db", default="../AutoTS/download/autots.duckdb")
-    p.add_argument("--out", default="dataset/universe_run_001/universe.csv")
+    p.add_argument(
+        "--out", default="dataset/global_001/universe.csv"
+    )
     p.add_argument("--top-mv", type=int, default=3000, help="市值排名上限")
     p.add_argument("--min-years", type=float, default=3.0, help="最少历史年限")
     p.add_argument(
@@ -58,6 +61,8 @@ def main():
     args = parse_args()
     if args.top_mv < 1 or args.min_years <= 0:
         raise ValueError("--top-mv 必须 >= 1，--min-years 必须 > 0")
+    if args.baidu_fresh_days < 0:
+        raise ValueError("--baidu-fresh-days 必须 >= 0")
 
     con = duckdb.connect(args.db, read_only=True)
     try:
@@ -81,6 +86,8 @@ def main():
             """,
             [args.top_mv],
         ).fetchdf()
+        if stocks["symbol"].duplicated().any():
+            raise ValueError("stock_list 标准化股票代码后存在重复")
 
         quotes = con.execute(
             f"""
@@ -112,6 +119,8 @@ def main():
             SELECT keyword, count(DISTINCT date) AS baidu_days,
                    max(date) AS baidu_last
             FROM baidu
+            WHERE source IN ('search_all', 'feed')
+              AND value IS NOT NULL
             GROUP BY 1
             """
         ).fetchdf()
@@ -125,10 +134,18 @@ def main():
     min_days = int(TRADING_DAYS_PER_YEAR * args.min_years)
     fresh_limit = asof - pd.Timedelta(days=args.baidu_fresh_days)
 
-    df = stocks.merge(quotes, on="symbol", how="left")
-    df = df.merge(rzrq, on="symbol", how="left")
+    df = stocks.merge(
+        quotes, on="symbol", how="left", validate="one_to_one"
+    )
     df = df.merge(
-        baidu, left_on="name", right_on="keyword", how="left"
+        rzrq, on="symbol", how="left", validate="one_to_one"
+    )
+    df = df.merge(
+        baidu,
+        left_on="name",
+        right_on="keyword",
+        how="left",
+        validate="many_to_one",
     )
 
     stages = {"top_mv": len(df)}
