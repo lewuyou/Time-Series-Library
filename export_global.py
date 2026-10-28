@@ -1,0 +1,301 @@
+# -*- coding: utf-8 -*-
+"""批量导出股票池数据，供共享模型联合训练（完整流程第 2 步）。
+
+完整流程（第 1~4 步）：
+    第 1 步 粗筛股票池
+        python select_universe.py --db ../AutoTS/download/autots.duckdb \
+            --out dataset/global_001/universe.csv \
+            --top-mv 3000 --min-years 3 --baidu-fresh-days 30
+
+    第 2 步 批量导出（本脚本）
+        python export_global.py --db ../AutoTS/download/autots.duckdb \
+            --universe-csv dataset/global_001/universe.csv \
+            --data-root dataset/global_001 \
+            --workers 4 --seq-len 60 --test-days 30 --val-days 60
+        输出 dataset/global_001/export_results.csv，只有 status == ok
+        的股票进入共享训练。
+
+    第 3 步 联合训练
+        python train_global_timexer.py --mode train \
+            --data-root dataset/global_001 \
+            --out-dir checkpoints/global_timexer_001 \
+            --epochs 30 --patience 5 --batch-size 256 --workers 0 \
+            --d-model 64 --e-layers 2 --patch-len 10 --device auto
+        输出 checkpoints/global_timexer_001/ 下的 checkpoint.pth、
+        history.json、schema.json、test_predictions.csv、
+        test_metrics.json、test_metrics_by_stock.csv。
+
+    第 4 步 推理预测（复用训练期预处理生成最新窗口）
+        python dataset.py --mode infer --db ../AutoTS/download/autots.duckdb \
+            --preprocessor dataset/global_001/601398/preprocessing.json \
+            --out-dir dataset/global_infer_001 --fail-on-history-drift
+        python train_global_timexer.py --mode predict \
+            --checkpoint checkpoints/global_timexer_001/checkpoint.pth \
+            --data-dir dataset/global_infer_001/601398 --device auto
+
+抽查导出质量（第 2 步之后、训练之前建议抽查几只）：
+    python dataset.py --mode validate --data-dir dataset/global_001/601398
+    覆盖窗口索引、标签一致性、切分边界、预处理与可用时间审计。
+
+设计要点：
+    - 每只股票独立导出、统一日期边界；特征并集 + 缺失标记由
+      train_global_timexer.py 统一处理，本脚本只负责单股导出与复检。
+    - 切分口径：最后 test_days（默认 30）个交易日为目标日的 test 集；
+      val_end = 倒数第 test_days+1 个交易日，train_end = 再往前 val_days
+      个交易日，保证 train/val 的输入窗口与标签完全不触碰最后 30 天数据。
+    - dataset.py 会按训练期覆盖率过滤特征列；本脚本导出后检查
+      feature_columns 仍保留 baidu_* 与 rzrq_*，缺失者标记为
+      filtered_no_baidu / filtered_no_rzrq，不进入共享训练。
+    - 断点续跑：data-root/export_config.json 登记导出配置；配置一致的
+      重复运行复用已有股票目录，配置变化必须换新的 data-root。
+    - 建议固定项目 git commit，避免官方 TimeXer.py / embedding 实现变化
+      后与 checkpoint 结构不兼容。
+
+注意：
+    select_universe.py 的粗筛（行情天数等）不保证百度/两融各自覆盖
+    训练期，最终以本脚本导出后的复检结果为准。
+"""
+
+import argparse
+import json
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+
+import duckdb
+import pandas as pd
+
+import dataset as ds
+
+# 进程级共享状态，由 init_worker 填充。
+_G = {}
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--db", default=ds.DEFAULT_DB)
+    p.add_argument("--universe-csv", required=True)
+    p.add_argument("--data-root", required=True)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--seq-len", type=int, default=60)
+    p.add_argument("--test-days", type=int, default=30)
+    p.add_argument("--val-days", type=int, default=60)
+    p.add_argument("--min-train-samples", type=int, default=250)
+    p.add_argument("--min-eval-samples", type=int, default=20)
+    return p.parse_args()
+
+
+def resolve_split(db, test_days, val_days):
+    """返回 (as_of, train_end, val_end, test_start)。与 dataset.py 同源的交易日历。"""
+    con = duckdb.connect(db, read_only=True)
+    try:
+        calendar, _ = ds.load_calendar(con, None, None, 50)
+        as_of = pd.Timestamp(
+            con.execute(
+                "SELECT max(date) FROM akshare_tx WHERE adjust='hfq'"
+            ).fetchone()[0]
+        ).normalize()
+        if as_of not in calendar:
+            raise ValueError(f"as-of {as_of.date()} 不在交易日历内")
+        upto = calendar[calendar <= as_of]
+        need = test_days + val_days + 300
+        if len(upto) < need:
+            raise ValueError(f"交易日不足：{len(upto)} < {need}")
+        val_end = upto[-(test_days + 1)]
+        train_end = upto[-(test_days + val_days + 1)]
+        test_start = upto[-test_days]
+        return as_of, train_end, val_end, test_start
+    finally:
+        con.close()
+
+
+def init_worker(db, data_root, as_of, train_end, val_end,
+                seq_len, min_train_samples, min_eval_samples):
+    """进程级初始化：只读 duckdb 连接 + 交易日历 + 预处理配置。"""
+    con = duckdb.connect(db, read_only=True)
+    calendar, calendar_info = ds.load_calendar(con, None, None, 50)
+    policies = ds.load_policies(None)
+    macro_fields = ["close", "volume"]
+    config = {
+        "seq_len": seq_len,
+        "return_type": "simple",
+        "macro_fields": macro_fields,
+        "macro_symbols": None,
+        "policies": policies,
+        "decision_hour": 8,
+        "decision_minute": 30,
+        "baidu_keyword": None,
+    }
+    max_lookback = max(
+        x["max_age_days"] + x["lag_days"] for x in policies.values()
+    )
+    aux_start = calendar.min() - pd.Timedelta(days=max_lookback + 10)
+    next_session = calendar[calendar.get_loc(as_of) + 1]
+    macro_specs = ds.load_macro(con, macro_fields, None, aux_start, next_session)
+    config["macro_symbols"] = sorted({x["symbol"] for x in macro_specs})
+
+    args_ns = argparse.Namespace(
+        mode="prepare", db=db, out_dir=str(data_root),
+        calendar=None, calendar_start=None, min_market_symbols=50,
+        symbol=None, industry=None, top=None, baidu_keyword=None,
+        as_of=str(as_of.date()), start=None, tail=None,
+        train_end=str(train_end.date()), val_end=str(val_end.date()),
+        seq_len=seq_len, return_type="simple",
+        min_train_samples=min_train_samples,
+        min_eval_samples=min_eval_samples,
+        min_feature_coverage=0.60, min_observations=100,
+        macro_fields=macro_fields, macro_symbols=None, source_policy=None,
+        decision_hour=8, decision_minute=30, preprocessor=None,
+        fail_on_history_drift=False, allow_calendar_drift=False,
+        continue_on_error=True,
+    )
+    _G.update(con=con, calendar=calendar, calendar_info=calendar_info,
+              config=config, macro_specs=macro_specs, args=args_ns,
+              as_of=as_of)
+
+
+def export_one(row):
+    """单只股票：断点导出 → 完整性检查 → 配置一致 → 辅助特征复检。"""
+    symbol = ds.norm_symbol(row["symbol"])
+    row = dict(row, symbol=symbol)
+    root = Path(_G["args"].out_dir) / symbol
+
+    try:
+        if not root.exists():
+            ds.prepare_one(
+                _G["con"],
+                row,
+                _G["args"],
+                _G["calendar"],
+                _G["as_of"],
+                _G["macro_specs"],
+                _G["config"],
+                _G["calendar_info"],
+            )
+
+        required = [
+            "feature_matrix.npy",
+            "samples.csv",
+            "preprocessing.json",
+            "dates.npy",
+        ]
+        for name in required:
+            if not (root / name).exists():
+                raise ValueError(f"不完整导出目录：缺少 {name}")
+
+        prep = json.loads(
+            (root / "preprocessing.json").read_text(encoding="utf-8")
+        )
+
+        args = _G["args"]
+        if (
+            prep["train_end"] != args.train_end
+            or prep["val_end"] != args.val_end
+            or prep["config"]["seq_len"] != args.seq_len
+            or prep["config"]["return_type"] != "simple"
+        ):
+            raise ValueError("已有导出的配置与本次任务不一致")
+
+        bases = [
+            c for c in prep["feature_columns"]
+            if not c.endswith(("__missing", "__age_days"))
+        ]
+
+        if not any(c.startswith("baidu_") for c in bases):
+            return {"symbol": symbol, "status": "filtered_no_baidu"}
+        if not any(c.startswith("rzrq_") for c in bases):
+            return {"symbol": symbol, "status": "filtered_no_rzrq"}
+
+        return {"symbol": symbol, "status": "ok"}
+
+    except Exception as exc:
+        return {
+            "symbol": symbol,
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def main():
+    a = parse_args()
+
+    if min(
+        a.workers, a.seq_len, a.test_days, a.val_days,
+        a.min_train_samples, a.min_eval_samples,
+    ) < 1:
+        raise ValueError("数量参数必须为正数")
+
+    rows = pd.read_csv(
+        a.universe_csv, dtype={"symbol": str}
+    ).to_dict("records")
+    if not rows:
+        raise ValueError("股票池为空")
+
+    symbols = [ds.norm_symbol(r["symbol"]) for r in rows]
+    if len(symbols) != len(set(symbols)):
+        raise ValueError("股票池存在重复股票代码")
+
+    as_of, train_end, val_end, test_start = resolve_split(
+        a.db, a.test_days, a.val_days
+    )
+
+    root = Path(a.data_root)
+    root.mkdir(parents=True, exist_ok=True)
+
+    spec = {
+        "db": str(Path(a.db).resolve()),
+        "as_of": str(as_of.date()),
+        "train_end": str(train_end.date()),
+        "val_end": str(val_end.date()),
+        "test_start": str(test_start.date()),
+        "seq_len": a.seq_len,
+        "min_train_samples": a.min_train_samples,
+        "min_eval_samples": a.min_eval_samples,
+        "symbols": sorted(symbols),
+        "dataset_version": ds.VERSION,
+    }
+
+    config_path = root / "export_config.json"
+    if config_path.exists():
+        old = json.loads(config_path.read_text(encoding="utf-8"))
+        if old != spec:
+            raise ValueError("导出配置已变化，请使用新的 data-root")
+    elif any(root.glob("*/preprocessing.json")):
+        raise ValueError("目录中存在未登记的旧导出，请使用新的 data-root")
+
+    ds.json_write(config_path, spec)
+    print(json.dumps(spec, ensure_ascii=False, indent=2))
+
+    results = []
+    with ProcessPoolExecutor(
+        max_workers=a.workers,
+        initializer=init_worker,
+        initargs=(
+            a.db,
+            str(root),
+            as_of,
+            train_end,
+            val_end,
+            a.seq_len,
+            a.min_train_samples,
+            a.min_eval_samples,
+        ),
+    ) as pool:
+        futures = [pool.submit(export_one, row) for row in rows]
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            print(result, flush=True)
+
+    report = pd.DataFrame(results)
+    report.to_csv(root / "export_results.csv", index=False)
+    print(report["status"].value_counts().to_dict())
+
+    if (report["status"] == "error").any():
+        print("存在导出错误；请查看 export_results.csv，修复后重跑。")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""筛选符合训练要求的股票池（只读数据库，输出股票清单 CSV + 筛选元信息）。
+"""筛选符合训练要求的股票池（完整流程第 1 步：只读数据库，输出股票清单 CSV + 筛选元信息）。
+
+用法：
+    python select_universe.py --db ../AutoTS/download/autots.duckdb \
+        --out dataset/global_001/universe.csv \
+        --top-mv 3000 --min-years 3 --baidu-fresh-days 30
 
 入选要求（对应需求）：
     1. 市值排在前 --top-mv 位（默认 3000，按 stock_list.total_mv 降序）；
@@ -7,18 +12,17 @@
        且仍在更新（最新观测日距库内最新行情日不超过 --baidu-fresh-days）；
     3. 辅助数据里有两融数据：rzrq 表中存在该股票记录；
     4. 总数据量不小于 --min-years 年（默认 3 年）：后复权行情
-       跨度 >= 365*min-years 天 且 有效交易日数 >= 244*min-years 天。
+       跨度 >= 365*min-years 天 且 有效交易日数（count(DISTINCT date)）
+       >= 244*min-years 天。
 
 说明：
     - 本脚本只是入库数据的粗筛（快速排除明显不合格的股票）；百度/两融
-      特征是否真的进入模型，由 run_universe.py 在导出后按
+      特征是否真的进入模型，由 export_global.py 在导出后按
       preprocessing.json 的 feature_columns 复检（训练期覆盖率不足 0.6
       的列会被 dataset.py 丢弃，复检不通过的股票不训练）。
+    - 这里的"三年"只是行情口径，不代表百度/两融各自都有三年数据，
+      后续仍须根据训练期覆盖率复检。
     - 百度关键词按 dataset.py 的口径取"当前股票简称"。
-
-用法：
-    python select_universe.py                          # 默认输出 dataset/universe_run_001/universe.csv
-    python select_universe.py --out my/universe.csv --top-mv 3000 --min-years 3
 """
 
 import argparse
@@ -28,7 +32,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from dataset import sql_symbol
+from dataset import json_write, sql_symbol
 
 # A 股一年约 244 个交易日；三年约 732。
 TRADING_DAYS_PER_YEAR = 244
@@ -81,7 +85,7 @@ def main():
         quotes = con.execute(
             f"""
             SELECT {sql_symbol("symbol")} AS symbol,
-                   count(*) AS quote_days,
+                   count(DISTINCT date) AS quote_days,
                    min(date) AS first_quote, max(date) AS last_quote
             FROM akshare_tx
             WHERE adjust = 'hfq'
@@ -177,13 +181,6 @@ def main():
     print(f"as_of={asof.date()} | 筛选漏斗：{json.dumps(stages, ensure_ascii=False)}")
     print(f"[OK] 入选 {len(df)} 只股票 -> {out}")
     return 0
-
-
-def json_write(path, obj):
-    Path(path).write_text(
-        json.dumps(obj, ensure_ascii=False, indent=2, allow_nan=False),
-        encoding="utf-8",
-    )
 
 
 if __name__ == "__main__":

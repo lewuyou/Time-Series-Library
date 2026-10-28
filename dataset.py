@@ -104,10 +104,22 @@ infer 模式的历史快照一致性：
     patch_len 必须整除 seq_len，否则 60/16 会丢弃最近 12 天目标历史，
     训练脚本已内置该校验。
 
+共享模型流程中的定位（完整流程见 export_global.py 头部说明）：
+    1. select_universe.py 粗筛股票池；
+    2. export_global.py 批量导出（复用本模块 prepare_one）并复检
+       baidu_/rzrq_ 特征，产出 export_results.csv；
+    3. train_global_timexer.py 联合训练（不依赖本模块，只读导出文件）；
+    4. 本模块 --mode validate 抽查导出质量；--mode infer 冻结训练期
+       预处理参数生成最新推理窗口，供 train_global_timexer.py
+       --mode predict 使用（同一股票必须复用训练期 scaler）。
+
 注意：
     这是自定义 Dataset 数据格式，不是 Dataset_Custom 的直接输入。
     不要对 feature_matrix.npy 再做标准化，也不要把 y_raw 或 y_scaled
     加到输入特征里。
+    可用时间假设对齐（观测日期 + 假设发布滞后）比直接按日期连接合理，
+    但原表没有真实历史发布时间，不能严格证明历史当时可见；百度指数
+    实际延迟、两融发布时刻、跨时区行情、宏观修订、历史复权更新需人工核实。
     当前股票列表、行业、市值用于选择处理对象，不作为历史数值特征。
     预测的是统计口径的下一交易日收盘收益率；t+1 日 08:30 产生信号后
     无法再按 t 日收盘价成交，该指标不能直接当作可实现交易收益。
