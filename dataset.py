@@ -16,8 +16,13 @@ holiday_calendar 推导（is_holiday_related 即休市标记），无需外部 C
     8. 两种样本划分布局（--split-layout，见 SPLIT_LAYOUTS）：
        train_val_test（默认，原协议：train/val/test 三分）；
        train_test（walk-forward 两阶段协议的重拟合导出：Train+Val 合并
-       为训练集、无验证集，--train-end 即最终训练截止日 fit_end；
-       测试覆盖率只登记不强制，不决定训练资格）
+       为训练集、无验证集，--train-end 即最终训练截止日 fit_end）。
+       两种布局下单股只强制训练样本下限；验证/测试覆盖率只登记在
+       manifest.quality，不决定训练资格（未来评估期发生停牌/缺数/退市
+       不应反过来剔除该股票的训练样本，避免测试期筛选偏差）。
+       samples.csv 自 v7 起区分两类口径：输入窗口有效（可预测）的行全部
+       保留，label_valid=False 表示目标日无有效标签（可预测、不可评分，
+       y_raw 为空），监督训练/评估装载时只取 label_valid=True 的行。
 
 预测时点：
     历史行情截至交易日 t。
@@ -44,7 +49,9 @@ holiday_calendar 推导（is_holiday_related 即休市标记），无需外部 C
     alignment_audit.csv      辅助数据来源时间审计
     feature_matrix.npy       [T, F]，float32，最终标准化矩阵
     dates.npy                [T]，交易日期
-    samples.csv              历史窗口位置、划分、标签
+    samples.csv              历史窗口位置、划分、label_valid、标签
+                             （label_valid=False 的行为"可预测但目标日
+                             无有效标签"，y_raw/y_scaled 为空，仅登记）
     train_preview.csv        训练前数据预览：逐交易日的标准化矩阵
                              （与 feature_matrix.npy 逐值一致）+ 当日原始
                              收益率 y_raw + 按目标日期口径的 train/val/test
@@ -154,12 +161,14 @@ except Exception:  # torch 仅训练读取需要，预处理可不安装
     HAS_TORCH = False
 
 
-VERSION = "stock_timexer_v6"
-# 可读取的历史版本：旧版缺少日历指纹、sample_selection、split_layout 等
-# 新增字段，infer 按兼容逻辑回退旧行为并提示。
+VERSION = "stock_timexer_v7"
+# 可读取的历史版本：旧版缺少日历指纹、sample_selection、split_layout、
+# label_valid 等新增字段，infer 按兼容逻辑回退旧行为并提示。
+# v7 起 samples.csv 区分"可预测"（input_eligible，行保留）与"可评分"
+# （label_valid=True），且单股仅强制训练样本下限，验证/测试覆盖率只登记。
 COMPATIBLE_VERSIONS = (
     "stock_timexer_v3", "stock_timexer_v4", "stock_timexer_v5",
-    "stock_timexer_v6",
+    "stock_timexer_v6", "stock_timexer_v7",
 )
 
 # 样本划分布局：
@@ -560,12 +569,19 @@ def macro_column(symbol, field):
 
 
 def load_macro(con, fields, symbols, start, end):
+    """返回宏观行情规格列表。
+
+    symbols 语义：None 表示自动发现区间内全部品种；显式空列表表示
+    "确实没有宏观品种"，直接返回空（不会被误当作自动发现）。
+    """
     if not set(fields).issubset({"close", "volume"}):
         raise ValueError("宏观字段只能为 close、volume")
+    if symbols is not None and len(symbols) == 0:
+        return []
 
     params = [start.date(), end.date()]
     where = "date >= ? AND date <= ?"
-    if symbols:
+    if symbols is not None:
         where += " AND symbol IN (" + ",".join("?" for _ in symbols) + ")"
         params.extend(symbols)
 
@@ -580,7 +596,7 @@ def load_macro(con, fields, symbols, start, end):
     assert_unique(df, ["symbol", "date"], "tradingview_macro")
     df = as_numeric(df, fields)
 
-    if symbols:
+    if symbols is not None:
         selected = sorted(set(symbols))
     else:
         selected = sorted(df["symbol"].dropna().unique().tolist())
@@ -812,12 +828,20 @@ def make_samples(features, core_valid, config, train_end, val_end,
       train_test：target <= train_end（此时 train_end 即重拟合截止日
         fit_end，包含原验证区间）为 train，其余为 test，不产生 val 样本。
 
-    剔除统计区分三类（对应"可预测 / 可标注"口径）：
+    样本口径区分"可预测 / 可评分"：
+      输入窗口有效的行全部保留（该预测在目标日早 08:30 本可合法发出），
+      其中目标日无有效行情或标签的行标记 label_valid=False、y_raw 为空，
+      保留在 samples.csv 中作为覆盖登记；监督训练/评估装载时只取
+      label_valid=True 的行（见 fit_preprocessing / PanelWindows）。
+      评分时排除无标签样本不可避免，但不得把它伪装成"那天没有生成预测"。
+
+    剔除统计区分三类：
       insufficient_history：历史不足，尚不能开窗（结构性预热）；
       invalid_input_window：输入窗口含无效核心行（多为停牌），无法在
         预测时点生成输入；
       invalid_target_label：输入窗口有效、预测本可发出，但目标日无有效
-        行情或标签（事后筛选，存在样本选择偏差，数量应被报告）。
+        行情或标签（= samples 中 label_valid=False 的行数，事后筛选
+        偏差应被报告而非静默）。
     """
     if split_layout not in SPLIT_LAYOUTS:
         raise ValueError(f"不支持的 split_layout：{split_layout}")
@@ -855,9 +879,12 @@ def make_samples(features, core_valid, config, train_end, val_end,
         if bad_prefix[end + 1] - bad_prefix[first] != 0:
             exclusions["invalid_input_window"] += 1
             continue
-        if not valid[target_pos] or not np.isfinite(y[target_pos]):
+
+        label_valid = bool(
+            valid[target_pos] and np.isfinite(y[target_pos])
+        )
+        if not label_valid:
             exclusions["invalid_target_label"] += 1
-            continue
 
         if split_layout == "train_test":
             split = "train" if target_date <= train_end else "test"
@@ -874,25 +901,34 @@ def make_samples(features, core_valid, config, train_end, val_end,
             "input_date": index[end],
             "target_date": target_date,
             "split": split,
-            "y_raw": float(y[target_pos]),
+            "label_valid": label_valid,
+            "y_raw": float(y[target_pos]) if label_valid else np.nan,
         })
 
     columns = [
         "start_pos", "end_pos", "target_pos", "input_date",
-        "target_date", "split", "y_raw",
+        "target_date", "split", "label_valid", "y_raw",
     ]
     result = pd.DataFrame(records, columns=columns)
     return result, len(candidate_targets), exclusions
 
 
 def fit_preprocessing(features, samples, groups, min_coverage, min_obs):
-    train = samples[samples["split"] == "train"]
+    # 只用合法训练样本（label_valid）拟合：无标签的"可预测"行不参与
+    # 统计量估计，也不贡献 fit 行。
+    train = samples[
+        (samples["split"] == "train") & samples["label_valid"]
+    ]
     if train.empty:
         raise ValueError("没有有效训练样本")
 
-    fit_mask = np.zeros(len(features), dtype=bool)
-    for row in train.itertuples(index=False):
-        fit_mask[row.start_pos:row.end_pos + 1] = True
+    # 差分数组构造 fit mask：O(样本数 + 行数)，避免逐窗口切片赋值。
+    diff = np.zeros(len(features) + 1, dtype=np.int64)
+    starts = train["start_pos"].to_numpy(dtype=np.int64)
+    ends = train["end_pos"].to_numpy(dtype=np.int64) + 1
+    np.add.at(diff, starts, 1)
+    np.add.at(diff, ends, -1)
+    fit_mask = np.cumsum(diff[:-1]) > 0
     fit = features.loc[fit_mask]
 
     keep, dropped, coverage = [], {}, {}
@@ -1031,10 +1067,13 @@ def coverage_report(features, valid_price, samples, train_end, val_end):
             report[name] = {"rows": 0}
             continue
         part = features.loc[mask]
+        in_split = samples["split"] == name
         report[name] = {
             "rows": int(mask.sum()),
             "valid_price_ratio": float(valid_price.loc[mask].mean()),
-            "samples": int((samples["split"] == name).sum()),
+            # 可评分样本（label_valid）；可预测行数见 eligible_signals。
+            "samples": int((in_split & samples["label_valid"]).sum()),
+            "eligible_signals": int(in_split.sum()),
             "feature_nonmissing_ratio": {
                 c: float(part[c].notna().mean()) for c in part
             },
@@ -1193,21 +1232,16 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
             features, core_valid, config, train_end, val_end,
             start=start, tail=args.tail, split_layout=split_layout,
         )
-        counts = samples["split"].value_counts()
-        # 能否拟合模型（train 下限）与能否完成该段评估（val/test 下限）
-        # 分开：train_test 布局只强制训练下限，测试覆盖率作为评估信息
-        # 登记，不决定训练资格。
-        minimums = {"train": args.min_train_samples}
-        if split_layout == "train_val_test":
-            minimums.update({
-                "val": args.min_eval_samples,
-                "test": args.min_eval_samples,
-            })
-        for split, minimum in minimums.items():
-            if int(counts.get(split, 0)) < minimum:
-                raise ValueError(
-                    f"{split} 样本不足：{int(counts.get(split, 0))} < {minimum}"
-                )
+        # 训练资格只由训练期（且标签有效）的样本量决定；验证/测试覆盖率
+        # 是评估信息，不决定训练资格（否则未来评估期停牌/缺数/退市会
+        # 反过来剔除训练完全合格的股票，形成测试期筛选偏差）。
+        scoreable = samples[samples["label_valid"]]
+        counts = scoreable["split"].value_counts()
+        if int(counts.get("train", 0)) < args.min_train_samples:
+            raise ValueError(
+                f"train 样本不足：{int(counts.get('train', 0))} "
+                f"< {args.min_train_samples}"
+            )
 
         preprocessing = fit_preprocessing(
             features, samples, groups,
@@ -1240,19 +1274,32 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
         report = coverage_report(
             features, valid_price, samples, train_end, val_end
         )
-        if split_layout == "train_test":
-            # train_test：测试覆盖率只登记、不强制（不决定训练资格）。
-            report["test_sample_minimum"] = {
-                "required": args.min_eval_samples,
-                "actual": int(counts.get("test", 0)),
-                "enforced": False,
-                "note": "测试覆盖率为评估信息；不足下限时股票仍可训练，"
-                        "评估期按实际有效样本参与",
-            }
+        # 验证/测试覆盖率登记（两种布局一致）：单股下限只用于报告对照，
+        # 不决定训练资格。整体层面"该折是否有足够验证证据选模型"由
+        # 训练装载检查（train_global_timexer）负责。
+        report["eval_sample_minimum"] = {
+            "required_per_stock": args.min_eval_samples,
+            "enforced": False,
+            "note": (
+                "验证/测试覆盖率为评估信息，不决定训练资格；单股仅强制"
+                "训练样本下限，评估期按实际有效样本参与"
+            ),
+            "per_stock_scoreable": {
+                "train": int(counts.get("train", 0)),
+                **(
+                    {"val": int(counts.get("val", 0))}
+                    if split_layout == "train_val_test" else {}
+                ),
+                "test": int(counts.get("test", 0)),
+            },
+        }
         report["candidate_target_dates"] = candidates
-        report["valid_samples"] = len(samples)
+        # valid_samples 为可评分样本（label_valid）；eligible_samples 为
+        # 可预测信号（含目标日无标签的行）。
+        report["valid_samples"] = int(len(scoreable))
+        report["eligible_samples"] = int(len(samples))
         report["valid_sample_ratio"] = (
-            float(len(samples) / candidates) if candidates else 0.0
+            float(len(scoreable) / candidates) if candidates else 0.0
         )
         report["sample_exclusions"] = exclusions
         report["prediction_eligible_dates"] = (
@@ -1442,7 +1489,14 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
 
     count_text = ""
     if samples is not None:
-        count_text = str(samples["split"].value_counts().to_dict())
+        scoreable_counts = samples.loc[
+            samples["label_valid"], "split"
+        ].value_counts().to_dict()
+        unscoreable = int((~samples["label_valid"]).sum())
+        count_text = (
+            str(scoreable_counts)
+            + (f" | unscoreable={unscoreable}" if unscoreable else "")
+        )
     print(
         f"[OK] {symbol} {row['name']} | "
         f"F={matrix.shape[1]} | {count_text} | latest={latest['saved']}"
@@ -1496,8 +1550,16 @@ def parse_args():
     )
     p.add_argument("--seq-len", type=int, default=60)
     p.add_argument("--return-type", choices=["simple", "log"], default="simple")
-    p.add_argument("--min-train-samples", type=int, default=250)
-    p.add_argument("--min-eval-samples", type=int, default=20)
+    p.add_argument(
+        "--min-train-samples", type=int, default=250,
+        help="单股可评分训练样本（label_valid）下限，低于该值的股票导出"
+             "失败（训练资格只由训练期决定）",
+    )
+    p.add_argument(
+        "--min-eval-samples", type=int, default=20,
+        help="单股验证/测试覆盖下限（仅登记到 manifest.quality."
+             "eval_sample_minimum 作报告对照，不决定训练资格）",
+    )
     p.add_argument("--min-feature-coverage", type=float, default=0.60)
     p.add_argument("--min-observations", type=int, default=100)
 
@@ -1578,20 +1640,45 @@ def validate_dataset(data_dir):
         print(line)
         return ok
 
-    # infer 导出不生成 samples.csv / train_preview.csv / 训练统计复核，
-    # 样本类检查跳过。
-    has_samples = (root / "samples.csv").exists()
-
+    # 必需文件由 manifest 登记的模式决定，而不是"缺 samples.csv 就当
+    # infer 跳过关键检查"——训练导出意外丢失样本文件必须判为验收失败。
     required = [
         "feature_matrix.npy", "dates.npy", "preprocessing.json",
-        "aligned_values.csv", "alignment_audit.csv",
+        "aligned_values.csv", "alignment_audit.csv", "manifest.json",
+        "features_unscaled.csv",
     ]
-    if has_samples:
-        required.append("train_preview.csv")
     missing = [f for f in required if not (root / f).exists()]
     record("required_files", not missing, f"缺失 {missing}" if missing else "")
     if missing:
         return False
+
+    manifest = json.loads(
+        (root / "manifest.json").read_text(encoding="utf-8")
+    )
+    export_mode = manifest.get("mode")
+    if export_mode not in ("prepare", "infer"):
+        record(
+            "manifest_mode", False,
+            f"manifest.mode={export_mode!r} 无法识别，无法判定必需文件",
+        )
+        return False
+
+    has_samples = (root / "samples.csv").exists()
+    if export_mode == "prepare" and not has_samples:
+        record(
+            "samples_required_for_prepare", False,
+            "训练导出（prepare）缺失 samples.csv，不能按 infer 跳过检查",
+        )
+        return False
+    if export_mode == "prepare":
+        required.append("train_preview.csv")
+        missing = [f for f in required if not (root / f).exists()]
+        record(
+            "required_files_prepare", not missing,
+            f"缺失 {missing}" if missing else "",
+        )
+        if missing:
+            return False
 
     matrix = np.load(root / "feature_matrix.npy")
     dates = pd.DatetimeIndex(np.load(root / "dates.npy"))
@@ -1609,11 +1696,18 @@ def validate_dataset(data_dir):
     samples = (
         pd.read_csv(root / "samples.csv") if has_samples else None
     )
-    if not has_samples:
+    if samples is None:
         record(
             "sample_checks_skipped", True,
             "无 samples.csv（infer 导出），跳过样本与切分检查",
         )
+    elif "label_valid" not in samples.columns:
+        record(
+            "label_valid_column", False,
+            "samples.csv 缺少 label_valid 列（旧版导出），请用当前版本"
+            "重新导出后再验收",
+        )
+        samples = None
 
     record("matrix_finite", bool(np.isfinite(matrix).all()))
     record(
@@ -1642,78 +1736,125 @@ def validate_dataset(data_dir):
         sp = samples["start_pos"].to_numpy(dtype=int)
         ep = samples["end_pos"].to_numpy(dtype=int)
         tp = samples["target_pos"].to_numpy(dtype=int)
-        record("target_pos_follows_window", bool((tp == ep + 1).all()))
-        record(
-            "window_length", bool((ep - sp + 1 == seq_len).all()),
-            f"seq_len={seq_len}",
+        # 先验证位置边界再索引，坏数据输出验收失败项而不是 IndexError。
+        in_range = bool(
+            (sp >= 0).all()
+            and (ep < len(dates)).all()
+            and (tp < len(dates)).all()
         )
-        input_dates = pd.to_datetime(samples["input_date"]).to_numpy()
-        target_dates = pd.to_datetime(samples["target_date"]).to_numpy()
         record(
-            "sample_pos_date_consistency",
-            bool(
-                (dates[ep] == input_dates).all()
-                and (dates[tp] == target_dates).all()
-            ),
-        )
-        record("target_after_input", bool((dates[tp] > dates[ep]).all()))
-
-        close = raw["px_close"].to_numpy(dtype=float)
-        if return_type == "log":
-            y_ref = np.log(close[tp] / close[tp - 1])
-        else:
-            y_ref = close[tp] / close[tp - 1] - 1.0
-        y_raw = samples["y_raw"].to_numpy(dtype=float)
-        err = float(np.max(np.abs(y_ref - y_raw))) if len(samples) else 0.0
-        record(
-            "y_raw_recompute_from_close", err <= 1e-9, f"max|Δ|={err:.2e}"
+            "sample_positions_in_range", in_range,
+            f"max_pos={max(tp.max(), ep.max()) if len(tp) else -1}, "
+            f"dates={len(dates)}",
         )
 
-        p = prep["statistics"][TARGET]
-        y_scaled_ref = (y_raw - p["mean"]) / p["scale"]
-        err2 = (
-            float(np.max(np.abs(matrix[tp, -1] - y_scaled_ref)))
-            if len(samples) else 0.0
+        allowed_splits = (
+            {"train", "test"} if split_layout == "train_test"
+            else {"train", "val", "test"}
         )
         record(
-            "y_scaled_matches_matrix", err2 <= 1e-4, f"max|Δ|={err2:.2e}"
+            "split_values_allowed",
+            set(samples["split"].dropna().unique()) <= allowed_splits,
+            f"observed={sorted(samples['split'].dropna().unique())}",
         )
 
-        if return_type == "log":
-            simple_ref = close[tp] / close[tp - 1] - 1.0
-            err3 = float(np.max(np.abs(np.expm1(y_raw) - simple_ref)))
+        label_valid = samples["label_valid"].to_numpy(dtype=bool)
+        record(
+            "label_invalid_rows_nan_y_raw",
+            bool(samples.loc[~label_valid, "y_raw"].isna().all()),
+            f"unscoreable={int((~label_valid).sum())}",
+        )
+
+        if in_range:
             record(
-                "log_to_simple_consistency", err3 <= 1e-12,
-                f"max|Δ|={err3:.2e}",
+                "target_pos_follows_window", bool((tp == ep + 1).all())
             )
-
-        tdate = pd.to_datetime(samples["target_date"])
-        split = samples["split"]
-        if split_layout == "train_test":
-            ok = (
-                (tdate[split == "train"] <= train_end).all()
-                and (tdate[split == "test"] > train_end).all()
-                and (split == "val").sum() == 0
-            )
-        else:
-            ok = (
-                (tdate[split == "train"] <= train_end).all()
-                and (tdate[split == "val"] > train_end).all()
-                and (tdate[split == "val"] <= val_end).all()
-                and (tdate[split == "test"] > val_end).all()
-            )
-        record("split_boundaries", bool(ok))
-
-        # rolling 导出（--start）时训练目标日不得早于登记的训练起点。
-        start_value = (prep.get("sample_selection") or {}).get("start")
-        if start_value is not None:
             record(
-                "train_start_lower_bound",
+                "window_length", bool((ep - sp + 1 == seq_len).all()),
+                f"seq_len={seq_len}",
+            )
+            input_dates = pd.to_datetime(samples["input_date"]).to_numpy()
+            target_dates = pd.to_datetime(samples["target_date"]).to_numpy()
+            record(
+                "sample_pos_date_consistency",
                 bool(
-                    (tdate[split == "train"] >= pd.Timestamp(start_value)).all()
+                    (dates[ep] == input_dates).all()
+                    and (dates[tp] == target_dates).all()
                 ),
-                f"start={start_value}",
             )
+            record(
+                "target_after_input", bool((dates[tp] > dates[ep]).all())
+            )
+
+            close = raw["px_close"].to_numpy(dtype=float)
+            if return_type == "log":
+                y_ref = np.log(close[tp] / close[tp - 1])
+            else:
+                y_ref = close[tp] / close[tp - 1] - 1.0
+            y_raw = samples["y_raw"].to_numpy(dtype=float)
+            err = (
+                float(np.max(np.abs(y_ref[label_valid] - y_raw[label_valid])))
+                if label_valid.any() else 0.0
+            )
+            record(
+                "y_raw_recompute_from_close", err <= 1e-9,
+                f"max|Δ|={err:.2e}",
+            )
+
+            p = prep["statistics"][TARGET]
+            y_scaled_ref = (y_raw - p["mean"]) / p["scale"]
+            err2 = (
+                float(np.max(np.abs(
+                    matrix[tp[label_valid], -1] - y_scaled_ref[label_valid]
+                )))
+                if label_valid.any() else 0.0
+            )
+            record(
+                "y_scaled_matches_matrix", err2 <= 1e-4,
+                f"max|Δ|={err2:.2e}",
+            )
+
+            if return_type == "log":
+                simple_ref = close[tp] / close[tp - 1] - 1.0
+                err3 = (
+                    float(np.max(np.abs(
+                        np.expm1(y_raw[label_valid])
+                        - simple_ref[label_valid]
+                    )))
+                    if label_valid.any() else 0.0
+                )
+                record(
+                    "log_to_simple_consistency", err3 <= 1e-12,
+                    f"max|Δ|={err3:.2e}",
+                )
+
+            tdate = pd.to_datetime(samples["target_date"])
+            split = samples["split"]
+            if split_layout == "train_test":
+                ok = (
+                    (tdate[split == "train"] <= train_end).all()
+                    and (tdate[split == "test"] > train_end).all()
+                    and (split == "val").sum() == 0
+                )
+            else:
+                ok = (
+                    (tdate[split == "train"] <= train_end).all()
+                    and (tdate[split == "val"] > train_end).all()
+                    and (tdate[split == "val"] <= val_end).all()
+                    and (tdate[split == "test"] > val_end).all()
+                )
+            record("split_boundaries", bool(ok))
+
+            # rolling 导出（--start）时训练目标日不得早于登记的训练起点。
+            start_value = (prep.get("sample_selection") or {}).get("start")
+            if start_value is not None:
+                record(
+                    "train_start_lower_bound",
+                    bool(
+                        (tdate[split == "train"] >= pd.Timestamp(start_value)).all()
+                    ),
+                    f"start={start_value}",
+                )
 
         # 训练前数据预览 CSV 与矩阵逐值一致（导出即训练输入的复核）。
         # CSV 十进制往返存在浮点表示噪声（float32 最短表示 ~1e-6 相对
@@ -1917,9 +2058,13 @@ def main():
                     )
                 current_sha = sha256_file(cal_path)
                 if current_sha != frozen_calendar.get("sha256_of_calendar_csv"):
-                    raise ValueError(
-                        "训练期日历 CSV 内容已变化（sha256 不一致），"
-                        "历史窗口与训练期不可比"
+                    # 全文件 sha 只作为版本记录；合法变化（在训练 as-of
+                    # 之后追加新交易日）由下方历史前缀校验兜底，这里提示
+                    # 而不是拒绝，避免阻断滚动追加。
+                    print(
+                        "[WARN] 日历 CSV 全文件 sha256 与训练期不同"
+                        "（可能追加了训练 as-of 之后的新交易日），"
+                        "将以历史前缀校验结果为准"
                     )
                 cal_start = frozen_calendar.get("calendar_start")
                 cal_min = frozen_calendar.get("min_market_symbols")
@@ -2057,7 +2202,16 @@ if HAS_TORCH:
             samples = pd.read_csv(root / "samples.csv")
             if "split" not in samples:
                 raise ValueError("samples.csv 缺少 split 列")
-            self.samples = samples[samples["split"] == split]
+            if "label_valid" not in samples:
+                raise ValueError(
+                    "samples.csv 缺少 label_valid 列（旧版导出），"
+                    "请用当前版本重新导出"
+                )
+            # 只装载可评分样本（label_valid）：无标签行 y_scaled 为空，
+            # 不能作为监督样本。
+            self.samples = samples[
+                (samples["split"] == split) & samples["label_valid"]
+            ]
             self.samples = self.samples.reset_index(drop=True)
             if self.samples.empty:
                 raise ValueError(f"{root} 没有 {split} 样本")
@@ -2100,9 +2254,15 @@ if HAS_TORCH:
             return values * p["scale"] + p["mean"]
 
         def to_simple_return(self, values):
-            """把标准化输出还原为简单收益率（对数标签自动 expm1）。"""
+            """把标准化输出还原为简单收益率（对数标签自动 expm1）。
+
+            values 可以是 numpy 数组或 torch 张量（评估工具会传张量），
+            expm1 相应选择实现。
+            """
             raw = self.inverse_target(values)
             if self.return_type == "log":
+                if HAS_TORCH and torch.is_tensor(raw):
+                    return torch.expm1(raw)
                 return np.expm1(raw)
             return raw
 

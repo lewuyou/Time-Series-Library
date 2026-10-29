@@ -8,28 +8,41 @@ import math
 class PositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super(PositionalEmbedding, self).__init__()
+        if d_model < 1 or max_len < 1:
+            raise ValueError('d_model and max_len must be positive')
+
         # Compute the positional encodings once in log space.
-        pe = torch.zeros(max_len, d_model).float()
-        pe.require_grad = False
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32)
+                             * -(math.log(10000.0) / d_model))
 
-        position = torch.arange(0, max_len).float().unsqueeze(1)
-        div_term = (torch.arange(0, d_model, 2).float()
-                    * -(math.log(10000.0) / d_model)).exp()
+        angles = position * div_term
+        pe = torch.zeros(max_len, d_model, dtype=torch.float32)
+        # support odd d_model: there is one more even column than odd columns
+        pe[:, 0::2] = torch.sin(angles)
+        pe[:, 1::2] = torch.cos(angles[:, :pe[:, 1::2].shape[1]])
 
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-
+        # keep the buffer persistent ('pe' key) for checkpoint compatibility
         pe = pe.unsqueeze(0)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        return self.pe[:, :x.size(1)]
+        if x.ndim != 3:
+            raise ValueError(
+                f'PositionalEmbedding expects a 3-D input [B, L, D], got {tuple(x.shape)}')
+        length = x.size(1)
+        if length > self.pe.size(1):
+            raise ValueError(
+                f'sequence length {length} exceeds the positional encoding limit {self.pe.size(1)}')
+        # cast to the input dtype so AMP does not silently up-cast the output
+        return self.pe[:, :length].to(dtype=x.dtype)
 
 
 class TokenEmbedding(nn.Module):
     def __init__(self, c_in, d_model):
         super(TokenEmbedding, self).__init__()
-        padding = 1 if torch.__version__ >= '1.5.0' else 2
+        # all supported torch versions (>= 1.5) use padding=1 here
+        padding = 1
         self.tokenConv = nn.Conv1d(in_channels=c_in, out_channels=d_model,
                                    kernel_size=3, padding=padding, padding_mode='circular', bias=False)
         for m in self.modules():
@@ -46,15 +59,15 @@ class FixedEmbedding(nn.Module):
     def __init__(self, c_in, d_model):
         super(FixedEmbedding, self).__init__()
 
-        w = torch.zeros(c_in, d_model).float()
-        w.require_grad = False
+        position = torch.arange(0, c_in, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32)
+                             * -(math.log(10000.0) / d_model))
 
-        position = torch.arange(0, c_in).float().unsqueeze(1)
-        div_term = (torch.arange(0, d_model, 2).float()
-                    * -(math.log(10000.0) / d_model)).exp()
-
-        w[:, 0::2] = torch.sin(position * div_term)
-        w[:, 1::2] = torch.cos(position * div_term)
+        angles = position * div_term
+        w = torch.zeros(c_in, d_model, dtype=torch.float32)
+        # support odd d_model: there is one more even column than odd columns
+        w[:, 0::2] = torch.sin(angles)
+        w[:, 1::2] = torch.cos(angles[:, :w[:, 1::2].shape[1]])
 
         self.emb = nn.Embedding(c_in, d_model)
         self.emb.weight = nn.Parameter(w, requires_grad=False)
@@ -127,12 +140,25 @@ class DataEmbedding(nn.Module):
 
 
 class DataEmbedding_inverted(nn.Module):
-    def __init__(self, c_in, d_model, embed_type='fixed', freq='h', dropout=0.1):
+    def __init__(self, seq_len, d_model, embed_type='fixed', freq='h', dropout=0.1):
         super(DataEmbedding_inverted, self).__init__()
-        self.value_embedding = nn.Linear(c_in, d_model)
+        # `seq_len` (the lookback window length) is the input dimension of the value
+        # embedding: each variate's whole series is projected onto one token.
+        # `embed_type` / `freq` are kept for interface compatibility but unused here.
+        self.seq_len = int(seq_len)
+        self.value_embedding = nn.Linear(self.seq_len, d_model)
         self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, x, x_mark):
+    def forward(self, x, x_mark=None):
+        if x.ndim != 3:
+            raise ValueError(
+                f'DataEmbedding_inverted expects x of shape [B, L, F], got {tuple(x.shape)}')
+        if x.size(1) != self.seq_len:
+            raise ValueError(
+                f'window length {x.size(1)} does not match the expected seq_len {self.seq_len}')
+        if x_mark is not None and (x_mark.ndim != 3 or x_mark.shape[:2] != x.shape[:2]):
+            raise ValueError('x_mark must match x on the batch and time dimensions')
+
         x = x.permute(0, 2, 1)
         # x: [Batch Variate Time]
         if x_mark is None:

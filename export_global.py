@@ -49,17 +49,22 @@
          b. 显式边界（walk-forward 每折）：--as-of、--train-end、
             --val-end 必须同时提供，均为交易日历内日期且满足
             train-end < val-end < as-of <= 库内最新行情日；此时
-            --test-days/--val-days 只用于登记与样本量下限校验，
-            实际边界以显式日期为准。可选 --train-start 限制最早
-            训练目标日期（rolling 训练窗口），不提供时使用全部可用
-            历史（expanding）；
+            --test-days/--val-days 只用于登记，实际边界以显式日期为准。
+            可选 --train-start 限制最早训练目标日期（rolling 训练窗口），
+            不提供时使用全部可用历史（expanding）；
       2) train_test（walk-forward 两阶段协议的重拟合导出）：
          必须显式提供 --as-of 与 --train-end（train_end 即重拟合截止日
          fit_end，包含原验证区间的标签），不得提供 --val-end；
          target <= train_end 全部为 train（验证集在测试开始前已成为
-         历史，可进入最终训练），target > train_end 为 test；
-         单股只强制训练样本下限，测试覆盖率登记在
-         manifest.quality.test_sample_minimum，不决定训练资格。
+         历史，可进入最终训练），target > train_end 为 test。
+    - 训练资格（两种布局一致）：单股只强制训练期可评分样本下限
+      （--min-train-samples）；验证/测试覆盖率只登记在
+      manifest.quality.eval_sample_minimum，不决定训练资格（避免
+      评估期停牌/缺数/退市反过来剔除训练合格的股票，形成测试期
+      筛选偏差）。--min-eval-samples 仅作为登记与配置一致性检查。
+    - samples.csv 区分"可预测 / 可评分"：输入窗口有效的行全部保留；
+      label_valid=False 的行（目标日无有效标签）保留作覆盖登记，
+      不参与监督训练与评估装载。
     - dataset.py 会按训练期覆盖率过滤特征列；本脚本导出后检查
       feature_columns 仍保留 baidu_* 与 rzrq_*，缺失者标记为
       filtered_no_baidu / filtered_no_rzrq，不进入共享训练。
@@ -116,7 +121,11 @@ def parse_args():
     p.add_argument("--test-days", type=int, default=30)
     p.add_argument("--val-days", type=int, default=60)
     p.add_argument("--min-train-samples", type=int, default=250)
-    p.add_argument("--min-eval-samples", type=int, default=20)
+    p.add_argument(
+        "--min-eval-samples", type=int, default=20,
+        help="单股验证/测试覆盖下限登记值（仅用于报告对照与配置一致性"
+             "检查，不决定训练资格）",
+    )
     p.add_argument(
         "--as-of",
         help="显式切分：本折数据截止日（测试结束日）；与 --train-end、"
@@ -420,13 +429,16 @@ def main():
     if a.seq_len < 2:
         raise ValueError("--seq-len 必须 >= 2")
     # train_test 布局没有验证区间：val-days 不参与校验；test-days 只是
-    # 必要条件（显式边界以日期为准，单股由 prepare_one() 判断）。
+    # 配置一致性检查（显式边界以日期为准，单股覆盖率只登记不强制）。
     eval_days_floor = (
         a.test_days if a.split_layout == "train_test"
         else min(a.test_days, a.val_days)
     )
     if eval_days_floor < a.min_eval_samples:
-        raise ValueError("测试/验证块长度不能小于 min-eval-samples")
+        raise ValueError(
+            "测试/验证块长度小于 min-eval-samples（登记值与配置不一致，"
+            "请检查 --test-days/--val-days/--min-eval-samples）"
+        )
     if a.split_layout == "train_test" and a.val_end:
         raise ValueError("train_test 布局没有验证集，不能提供 --val-end")
 

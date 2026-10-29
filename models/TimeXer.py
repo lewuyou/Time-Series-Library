@@ -154,7 +154,24 @@ class Model(nn.Module):
         self.head = FlattenHead(configs.enc_in, self.head_nf, configs.pred_len,
                                 head_dropout=configs.dropout)
 
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+    @staticmethod
+    def _check_ex_mask(ex_mask, batch_size, n_tokens):
+        """Validate the exogenous-token mask.
+
+        ex_mask: [B, n_ex_tokens] bool tensor, True = the corresponding exogenous
+        variate token is invalid/missing and must not be attended to.
+        """
+        if not isinstance(ex_mask, torch.Tensor):
+            raise TypeError('ex_mask must be a torch bool tensor')
+        if ex_mask.dtype != torch.bool:
+            raise TypeError('ex_mask must be a bool tensor (True = masked)')
+        if ex_mask.ndim != 2 or tuple(ex_mask.shape) != (batch_size, n_tokens):
+            raise ValueError(
+                f'ex_mask shape {tuple(ex_mask.shape)} does not match '
+                f'[batch={batch_size}, exogenous tokens={n_tokens}]')
+        return ex_mask
+
+    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, ex_mask=None):
         if self.use_norm:
             # Normalization from Non-stationary Transformer
             means = x_enc.mean(1, keepdim=True).detach()
@@ -167,7 +184,13 @@ class Model(nn.Module):
         en_embed, n_vars = self.en_embedding(x_enc[:, :, -1].unsqueeze(-1).permute(0, 2, 1))
         ex_embed = self.ex_embedding(x_enc[:, :, :-1], x_mark_enc)
 
-        enc_out = self.encoder(en_embed, ex_embed)
+        cross_mask = None
+        if ex_mask is not None:
+            ex_mask = self._check_ex_mask(ex_mask, x_enc.shape[0], ex_embed.shape[1])
+            # [B, 1, 1, S]: broadcast over heads and the single global query
+            cross_mask = ex_mask.unsqueeze(1).unsqueeze(1)
+
+        enc_out = self.encoder(en_embed, ex_embed, cross_mask=cross_mask)
         enc_out = torch.reshape(
             enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
         # z: [bs x nvars x d_model x patch_num]
@@ -184,7 +207,7 @@ class Model(nn.Module):
         return dec_out
 
 
-    def forecast_multi(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+    def forecast_multi(self, x_enc, x_mark_enc, x_dec, x_mark_dec, ex_mask=None):
         if self.use_norm:
             # Normalization from Non-stationary Transformer
             means = x_enc.mean(1, keepdim=True).detach()
@@ -197,7 +220,13 @@ class Model(nn.Module):
         en_embed, n_vars = self.en_embedding(x_enc.permute(0, 2, 1))
         ex_embed = self.ex_embedding(x_enc, x_mark_enc)
 
-        enc_out = self.encoder(en_embed, ex_embed)
+        cross_mask = None
+        if ex_mask is not None:
+            ex_mask = self._check_ex_mask(ex_mask, x_enc.shape[0], ex_embed.shape[1])
+            # [B, 1, 1, S]: broadcast over heads and the single global query
+            cross_mask = ex_mask.unsqueeze(1).unsqueeze(1)
+
+        enc_out = self.encoder(en_embed, ex_embed, cross_mask=cross_mask)
         enc_out = torch.reshape(
             enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
         # z: [bs x nvars x d_model x patch_num]
@@ -213,13 +242,22 @@ class Model(nn.Module):
 
         return dec_out
 
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None, ex_mask=None):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
+            if mask is not None:
+                # Previously `mask` was accepted but silently ignored. Refuse it
+                # explicitly: for forecast tasks there is no imputation mask.
+                # To mask missing exogenous variates use `ex_mask`
+                # ([B, n_ex_tokens] bool, True = masked).
+                raise NotImplementedError(
+                    'TimeXer forecast does not use the imputation-style `mask` '
+                    'input; pass `ex_mask` ([B, n_ex_tokens] bool, True = masked) '
+                    'to mask exogenous tokens')
             if self.features == 'M':
-                dec_out = self.forecast_multi(x_enc, x_mark_enc, x_dec, x_mark_dec)
+                dec_out = self.forecast_multi(x_enc, x_mark_enc, x_dec, x_mark_dec, ex_mask=ex_mask)
                 return dec_out[:, -self.pred_len:, :]  # [B, L, D]
             else:
-                dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
+                dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec, ex_mask=ex_mask)
                 return dec_out[:, -self.pred_len:, :]  # [B, L, D]
         else:
             return None

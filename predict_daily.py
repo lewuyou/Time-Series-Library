@@ -43,7 +43,8 @@ import pandas as pd
 import torch
 
 from train_global_timexer import (
-    TARGET, align_features, build_model, read_json,
+    TARGET, align_features, build_model, compute_ex_mask,
+    exogenous_mask_layout, read_json,
 )
 
 REPO = Path(__file__).resolve().parent
@@ -112,7 +113,12 @@ def score(args, saved, device):
     schema = saved["schema"]
     config = saved["model_config"]
 
-    rows, arrays, symbols = [], [], []
+    # 掩码协议跟随 checkpoint：训练时启用 ex_mask 的模型，打分时必须
+    # 同样屏蔽窗口内整段无观测的外生值 token（判定只看 __missing 标记）。
+    use_ex_mask = bool(config.get("ex_mask", False))
+    ex_mask_layout = exogenous_mask_layout(schema)
+
+    rows, arrays, masks, symbols = [], [], [], []
     for symbol, prep in saved["preprocessing"].items():
         path = infer_root / symbol / "latest.npz"
         if not path.exists():
@@ -129,6 +135,8 @@ def score(args, saved, device):
             rows.append({"symbol": symbol, "note": "non_finite"})
             continue
         arrays.append(x[0])
+        if use_ex_mask:
+            masks.append(compute_ex_mask(x, ex_mask_layout)[0])
         symbols.append(symbol)
         rows.append({
             "symbol": symbol, "note": "ok",
@@ -144,7 +152,14 @@ def score(args, saved, device):
     preds = []
     for i in range(0, len(arrays), args.batch_size):
         batch = torch.from_numpy(np.stack(arrays[i:i + args.batch_size])).to(device)
-        out = model(batch, None, None, None).reshape(-1).cpu().numpy()
+        ex_mask = None
+        if use_ex_mask:
+            ex_mask = torch.from_numpy(
+                np.stack(masks[i:i + args.batch_size])
+            ).to(device)
+        out = model(
+            batch, None, None, None, ex_mask=ex_mask
+        ).reshape(-1).cpu().numpy()
         preds.append(out)
 
     frame = pd.DataFrame(rows).set_index("symbol")

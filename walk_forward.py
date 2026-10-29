@@ -106,10 +106,10 @@
        data/<fold_id>/export_results.csv；不要事后取所有折都成功的
        股票交集重训，否则重新引入未来筛选；
     5. 评估仍是统计口径收益率，不是可实现交易收益；
-    6. --min-eval-samples >= --test-days 时要求每只股票测试块内全部
-       交易日有效（例如 20/20），约束严格；可事先统一选择较低下限
-       （如 10），但不能看完某折结果后再有针对性地调整。重拟合导出
-       （train_test）中测试覆盖率只登记不强制，不决定训练资格；
+    6. 单股验证/测试覆盖率只登记不强制、不决定训练资格（两种布局
+       一致）：评估期停牌/缺数/退市不影响训练资格，避免测试期筛选
+       偏差；--min-eval-samples 仅作为登记与配置一致性检查（评估块
+       长度对照），整体验证集/测试集为空才会在训练装载时报错；
     7. 跨折 warm-start 未实现，保留为独立实验：1) 每折重新拟合每股
        scaler/schema/特征保留列后，上一折权重不能当作无条件兼容的
        连续训练状态；2) 上一折最终模型可能已见过本折验证窗口标签，
@@ -152,6 +152,7 @@ import sys
 from pathlib import Path
 
 import duckdb
+import numpy as np
 import pandas as pd
 
 import dataset as ds
@@ -184,9 +185,17 @@ def read_db_state(con, calendar):
     }
 
 
-def ensure_db_state(con, calendar, baseline_state, stage_label):
-    """各阶段导出前的数据库快照守护：追加行情或日历变化即硬失败。"""
-    current_state = read_db_state(con, calendar)
+def ensure_db_state(con, baseline_state, stage_label):
+    """各阶段导出前的数据库快照守护：追加行情或日历变化即硬失败。
+
+    指纹计算使用的日历在每次检查时从数据库重新推导（而不是复用
+    进程启动时的加载结果），这样"日历表变化但行情最新日期未变"
+    的情况（如 holiday_calendar 补录休市日）也能被发现。
+    """
+    current_calendar, _ = ds.load_calendar(
+        con, None, ds.DEFAULT_CALENDAR_START, 50
+    )
+    current_state = read_db_state(con, current_calendar)
     if current_state != baseline_state:
         raise ValueError(
             f"数据库在运行期间发生变化（{stage_label}：最新行情日或"
@@ -327,6 +336,10 @@ def train_command(a, data_root, out_dir, mode, epochs=None, extra=None):
         "--seed", str(a.seed),
         "--device", a.device,
     ]
+    # 外生 token 掩码协议：选择 / 重拟合两阶段一致透传，
+    # 与 train_global_timexer.py 的 --ex-mask 对应（默认关闭）。
+    if getattr(a, "ex_mask", False):
+        command += ["--ex-mask"]
     if epochs is not None:
         command += ["--epochs", str(epochs)]
     if mode == "train":
@@ -426,23 +439,36 @@ def protocol_comparison(control, treatment):
     def pooled(pred_col):
         if merged.empty:
             return None
-        err = merged[pred_col] - merged["y_true_refit"]
+        usable = merged[[pred_col, "y_true_refit"]].dropna()
+        if usable.empty:
+            return None
+        err = usable[pred_col] - usable["y_true_refit"]
         return {
             "mse": float((err ** 2).mean()),
             "mae": float(err.abs().mean()),
         }
 
     def daily_rank_ic(pred_col):
+        # 有限性/退化日过滤：y_true 恒定或预测恒定的交易日 RankIC 无
+        # 定义（NaN），必须跳过而不是写进结果（json 写入禁止 NaN，
+        # 崩溃会发生在整趟 walk-forward 的最后一步）。
         if merged.empty:
             return None
         grouped = merged.groupby("target_date")
         per_day = []
         for _, day in grouped:
-            if len(day) < 3 or day[pred_col].nunique() < 2:
+            day = day[[pred_col, "y_true_refit"]].dropna()
+            if (
+                len(day) < 3
+                or day[pred_col].nunique() < 2
+                or day["y_true_refit"].nunique() < 2
+            ):
                 continue
-            per_day.append(
-                float(day[pred_col].rank().corr(day["y_true_refit"].rank()))
+            value = float(
+                day[pred_col].rank().corr(day["y_true_refit"].rank())
             )
+            if np.isfinite(value):
+                per_day.append(value)
         return float(pd.Series(per_day).mean()) if per_day else None
 
     def coverage(frame):
@@ -533,10 +559,9 @@ def parse_args():
     p.add_argument("--min-train-samples", type=int, default=250)
     p.add_argument(
         "--min-eval-samples", type=int, default=20,
-        help="单股每折 val/test 有效样本下限；等于 test-days 时要求测试块"
-             "内全部交易日有效，可事先统一选择较低下限（如 10），但不能"
-             "看完某折结果后再调整；重拟合导出（train_test）中测试"
-             "覆盖率只登记不强制，不决定训练资格",
+        help="单股验证/测试覆盖下限登记值（仅写入 manifest.quality."
+             "eval_sample_minimum 作报告对照，不决定训练资格；与 "
+             "val-days/test-days 的一致性在启动时检查）",
     )
     p.add_argument("--export-workers", type=int, default=4)
 
@@ -551,6 +576,13 @@ def parse_args():
     p.add_argument("--e-layers", type=int, default=2)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--patch-len", type=int, default=10)
+    p.add_argument(
+        "--ex-mask", action="store_true",
+        help="屏蔽窗口内整段无观测的外生值 token（透传给 "
+             "train_global_timexer.py --ex-mask，选择/重拟合两阶段一致；"
+             "默认关闭＝维持既有\"填补＋缺失标记\"协议，建议以消融"
+             "实验对比后再采用）",
+    )
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--weight-decay", type=float, default=1e-4)
@@ -575,8 +607,8 @@ def main():
 
     if min(a.val_days, a.test_days) < a.min_eval_samples:
         raise ValueError(
-            "选择阶段保留单股评估样本下限，"
-            "val-days/test-days 不能小于 min-eval-samples"
+            "评估块长度小于 min-eval-samples 登记值（配置不一致，"
+            "请检查 --val-days/--test-days/--min-eval-samples）"
         )
 
     if a.refit_window_policy == "keep_train_days" and a.train_days is None:
@@ -760,7 +792,7 @@ def main():
             if not a.refit:
                 # ===== 无重拟合协议 A（原协议，保留作为对照）=====
                 ensure_db_state(
-                    con, calendar, baseline_state, f"{fold_id} export"
+                    con, baseline_state, f"{fold_id} export"
                 )
 
                 data_root = root / "data" / fold_id
@@ -814,7 +846,7 @@ def main():
 
             # ===== 两阶段协议 B：阶段 1 选择 =====
             ensure_db_state(
-                con, calendar, baseline_state, f"{fold_id} selection export"
+                con, baseline_state, f"{fold_id} selection export"
             )
 
             selection_data_root = root / "data" / fold_id / "selection"
@@ -878,7 +910,7 @@ def main():
 
             # ===== 阶段 2 重拟合 =====
             ensure_db_state(
-                con, calendar, baseline_state, f"{fold_id} refit export"
+                con, baseline_state, f"{fold_id} refit export"
             )
 
             if a.pit_universe:

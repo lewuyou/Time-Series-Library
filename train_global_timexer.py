@@ -76,6 +76,18 @@
        checkpoint 时会直接拒绝训练。
     8. predict 仅支持 checkpoint 中登记过的股票（每股训练期 scaler），
        是"当前训练股票池共享一个模型"，不是任意新股票的零样本预测。
+    9. 样本装载只取 label_valid=True 的行（可评分样本）；label_valid=False
+       的行（输入窗口有效、目标日无标签）保留在 samples.csv 中作覆盖
+       登记，不进入监督训练与评估。y_true 直接取样本表 float64 y_raw，
+       不经 float32 标签反标准化重建。
+    10. 验证/测试集按 allow_missing 装载：单股缺少某评估 split 的样本只
+        影响该股评估（该股 0 权重），不影响训练资格；整体验证集为空时
+        报错（无证据选预算），整体测试集为空时 train 模式报错、refit
+        模式（生产全量重拟合 train_end == as_of）跳过测试评估并照常
+        写 fit_metadata。
+    11. selection_result.json 在测试评估之前落盘（先登记预算再评估）；
+        train_refit 校验 --selection-json 的折边界（val_end / as_of /
+        test_start 与重拟合导出一致），防止错配的阶段产物被复用。
 
 已知局限（详见使用说明第九节）：
     1. "按假设发布时间对齐"不是真实 point-in-time：百度指数实际延迟、
@@ -143,6 +155,42 @@ def align_features(x, source_columns, schema):
     src = [source[schema[i]] for i in dst]
     result[..., dst] = x[..., src]
     return result
+
+
+def exogenous_mask_layout(schema):
+    """外生值列 -> 缺失标记列的位置映射（不含 target）。
+
+    schema[:-1] 与 TimeXer 的外生 token 顺序（x_enc[:, :, :-1]）一致。
+    缺失标记列与数据年龄列本身是信息来源，不参与屏蔽判定；
+    返回 (n, 2) int64 数组：第 0 列为值列 token 位置，第 1 列为
+    对应 `值列__missing` 标记列位置。
+    """
+    pos = {c: i for i, c in enumerate(schema)}
+    pairs = []
+    for j, c in enumerate(schema[:-1]):
+        if c.endswith("__missing") or c.endswith("__age_days"):
+            continue
+        flag = pos.get(c + "__missing")
+        if flag is not None:
+            pairs.append((j, flag))
+    return np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+
+
+def compute_ex_mask(x, layout):
+    """按窗口计算外生 token 有效性掩码。
+
+    x: 已对齐到 schema 的特征矩阵，[..., seq_len, n_schema]。
+    layout: exogenous_mask_layout(schema) 的输出。
+    返回 [..., n_schema-1] bool：True = 该外生值列在本窗口内
+    整段无有效观测（标记列全为 1；股票缺列时 align_features
+    已把标记列置 1）。判定只用标记列，不看值列数值是否为 0。
+    缺失标记 / 数据年龄列本身永不屏蔽。
+    """
+    ex_mask = np.zeros(x.shape[:-2] + (x.shape[-1] - 1,), dtype=bool)
+    if len(layout):
+        masked = (x[..., layout[:, 1]] == 1.0).all(axis=-2)
+        ex_mask[..., layout[:, 0]] = masked
+    return ex_mask
 
 
 def load_catalog(data_root, expected_layout=None):
@@ -248,9 +296,12 @@ def load_catalog(data_root, expected_layout=None):
 
         sample = pd.read_csv(
             directory / "samples.csv",
-            usecols=["split", "y_raw"],
+            usecols=["split", "label_valid", "y_raw"],
         )
-        train_y = sample.loc[sample.split == "train", "y_raw"]
+        # 训练统计只用可评分训练样本（label_valid）。
+        train_y = sample.loc[
+            (sample.split == "train") & sample.label_valid, "y_raw"
+        ]
         if train_y.empty:
             raise ValueError(f"{symbol}: 没有训练样本")
 
@@ -284,8 +335,11 @@ class PanelWindows(Dataset):
         其余为 test（原协议）；
       train_test：target <= train_end（重拟合截止日 fit_end）为 train，
         其余为 test，没有 val。
-    allow_missing：train_test 的测试块内允许个别股票全程无有效样本
-    （停牌等；覆盖率不决定训练资格），装载时跳过，该股票不产生预测；
+    样本只装载 label_valid=True 的行（可评分样本；无标签行是覆盖登记）。
+    __getitem__ 返回 (x, y, sid, target, y_raw)：y 为标准化 float32 标签
+    （训练/验证损失用），y_raw 为 float64 原始标签（评估真值直接取用）。
+    allow_missing：允许个别股票在本 split 全程无有效样本（停牌等；
+    覆盖率不决定训练资格），装载时跳过，该股票不参与该 split；
     其余情况样本缺失视为导出/装载错配，直接报错。
     """
 
@@ -311,10 +365,14 @@ class PanelWindows(Dataset):
                 Path(r["root"]) / "samples.csv",
                 usecols=[
                     "start_pos", "end_pos", "target_pos",
-                    "split", "y_scaled", "y_raw",
+                    "split", "label_valid", "y_scaled", "y_raw",
                 ],
             )
-            frame = frame.loc[frame.split == split].copy()
+            # 只装载可评分样本（label_valid）：输入窗口有效但目标日无
+            # 标签的行是覆盖登记，不能作为监督样本。
+            frame = frame.loc[
+                (frame.split == split) & frame.label_valid
+            ].copy()
             if frame.empty:
                 if allow_missing:
                     continue
@@ -369,8 +427,16 @@ class PanelWindows(Dataset):
             ys = frame.y_scaled.to_numpy(dtype=np.float32)
             if not np.allclose(ys, expected, rtol=1e-5, atol=1e-5):
                 raise ValueError(f"{r['symbol']}: 标签标准化不一致")
+            # float64 y_raw 随样本透传：y_true 评估直接用原始标签，
+            # 不经 float32 标签反标准化重建（两阶段协议的 y_true 一致性
+            # 检查因此可以精确到 0）。
+            raws = frame.y_raw.to_numpy(dtype=np.float64)
+            if not np.isfinite(raws).all():
+                raise ValueError(
+                    f"{r['symbol']}: {split} 可评分样本存在非有限 y_raw"
+                )
 
-            self.parts.append((positions, ys))
+            self.parts.append((positions, ys, raws))
             self.record_ids.append(record_id)
             counts.append(len(frame))
 
@@ -405,6 +471,9 @@ class PanelWindows(Dataset):
         self.missing = [
             i for i, c in enumerate(schema) if c.endswith("__missing")
         ]
+        # 外生值列 -> 缺失标记列映射：__getitem__ 据此产出 ex_mask。
+        # 是否把 ex_mask 传入模型由调用方（--ex-mask）决定，数据集恒产出。
+        self.ex_mask_layout = exogenous_mask_layout(schema)
 
     def __len__(self):
         return int(self.ends[-1]) if len(self.ends) else 0
@@ -429,7 +498,7 @@ class PanelWindows(Dataset):
         offset = 0 if local_id == 0 else int(self.ends[local_id - 1])
         local = index - offset
 
-        positions, labels = self.parts[local_id]
+        positions, labels, raws = self.parts[local_id]
         sid = self.record_ids[local_id]
         start, end, target = positions[local]
         raw = self.matrix(sid)[start:end + 1]
@@ -441,8 +510,14 @@ class PanelWindows(Dataset):
         dst, src = self.maps[sid]
         x[:, dst] = raw[:, src]
 
+        # 外生 token 有效性掩码（见 compute_ex_mask）：第 6 个元素。
+        # 只标记"窗口内整段无观测"的外生值列；缺失标记 / 年龄列不屏蔽。
+        ex_mask = compute_ex_mask(x, self.ex_mask_layout)
+
         y = np.array([[labels[local]]], dtype=np.float32)
-        return x, y, sid, int(target)
+        # 第五个元素：float64 原始标签（y_raw），评估侧直接使用；
+        # 第六个元素：ex_mask（是否启用由训练/推理脚本的 --ex-mask 决定）。
+        return x, y, sid, int(target), np.float64(raws[local]), ex_mask
 
 
 class TypedExogenousEmbedding(nn.Module):
@@ -475,7 +550,7 @@ def build_model(config):
     return model
 
 
-def run_epoch(model, loader, device, optimizer=None):
+def run_epoch(model, loader, device, optimizer=None, use_ex_mask=False):
     training = optimizer is not None
     model.train(training)
 
@@ -488,7 +563,7 @@ def run_epoch(model, loader, device, optimizer=None):
     count = 0
 
     with torch.set_grad_enabled(training):
-        for x, y, sid, _ in loader:
+        for x, y, sid, _, _, ex_mask in loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             sid = sid.to(device, non_blocking=True)
@@ -496,7 +571,14 @@ def run_epoch(model, loader, device, optimizer=None):
             if not torch.isfinite(x).all() or not torch.isfinite(y).all():
                 raise ValueError("输入/标签存在非有限值")
 
-            pred = model(x, None, None, None)
+            # ex_mask 数据集恒产出；use_ex_mask=False 时不传入模型，
+            # 与既有"填补 + 缺失标记"协议逐位一致。
+            if use_ex_mask:
+                ex_mask = ex_mask.to(device, non_blocking=True)
+            else:
+                ex_mask = None
+
+            pred = model(x, None, None, None, ex_mask=ex_mask)
             if pred.shape != y.shape:
                 raise ValueError(f"输出 {pred.shape} != 标签 {y.shape}")
 
@@ -508,7 +590,10 @@ def run_epoch(model, loader, device, optimizer=None):
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                # 梯度非有限时立即报错，而不是让 NaN/Inf 静默进入参数。
+                nn.utils.clip_grad_norm_(
+                    model.parameters(), 1.0, error_if_nonfinite=True
+                )
                 optimizer.step()
 
             total += loss.detach().item() * len(x)
@@ -518,18 +603,25 @@ def run_epoch(model, loader, device, optimizer=None):
 
 
 @torch.no_grad()
-def test_predictions(model, loader, records, device):
+def test_predictions(model, loader, records, device, use_ex_mask=False):
     model.eval()
     chunks = []
 
-    for x, y, sid, target in loader:
-        output = model(x.to(device), None, None, None)
+    for x, y, sid, target, y_raw, ex_mask in loader:
+        # 与训练协议一致：use_ex_mask=False 时掩码不进入模型。
+        if use_ex_mask:
+            ex_mask = ex_mask.to(device, non_blocking=True)
+        else:
+            ex_mask = None
+        output = model(x.to(device), None, None, None, ex_mask=ex_mask)
         if output.shape != y.shape:
             raise ValueError("测试输出维度不正确")
 
         pred_scaled = output.cpu().numpy().reshape(-1)
-        true_scaled = y.numpy().reshape(-1)
         last_scaled = x[:, -1, -1].numpy()
+        # y_true 直接用样本表 float64 原始标签（与两阶段协议的
+        # y_true 一致性检查对齐），不经 float32 标签反标准化重建。
+        y_true = y_raw.numpy().astype(np.float64)
 
         ids = sid.numpy()
         target = target.numpy()
@@ -548,7 +640,7 @@ def test_predictions(model, loader, records, device):
                 str(records[i]["dates"][j].astype("datetime64[D]"))
                 for i, j in zip(ids, target)
             ],
-            "y_true": true_scaled * scales + means,
+            "y_true": y_true,
             "y_pred": pred_scaled * scales + means,
             "baseline_zero": np.zeros(len(ids)),
             "baseline_mean": [records[i]["train_mean"] for i in ids],
@@ -644,6 +736,45 @@ def now_text():
     return pd.Timestamp.now(tz="Asia/Shanghai")
 
 
+def environment_info(device):
+    """训练产物登记运行环境（版本/设备），便于复现性审计。
+
+    运行环境的墙钟性能不影响预测口径，只用于追溯训练条件。
+    """
+    import platform
+
+    info = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+        "device": str(device),
+        "cuda_available": bool(torch.cuda.is_available()),
+    }
+    try:
+        import duckdb
+
+        info["duckdb"] = duckdb.__version__
+    except ImportError:
+        pass
+    if torch.cuda.is_available():
+        info["cuda_version"] = torch.version.cuda
+    try:
+        import subprocess
+
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).parent,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).decode().strip()
+        if commit:
+            info["git_commit"] = commit
+    except Exception:
+        pass
+    return info
+
+
 def train(args, device):
     if not args.data_root or not args.out_dir:
         raise ValueError("train 需要 --data-root 和 --out-dir")
@@ -660,7 +791,13 @@ def train(args, device):
         args.data_root, expected_layout="train_val_test"
     )
     train_ds = PanelWindows(records, schema, "train")
-    val_ds = PanelWindows(records, schema, "val")
+    # 单股验证覆盖不足（停牌/缺数）只影响该股早停贡献，不影响训练资格；
+    # 整体验证集为空则无证据选预算，必须报错。
+    val_ds = PanelWindows(records, schema, "val", allow_missing=True)
+    if len(val_ds) == 0:
+        raise ValueError(
+            "整体验证集没有任何可评分样本，无法早停选预算"
+        )
 
     seq_len = train_ds.seq_len
     if args.patch_len < 1 or seq_len % args.patch_len:
@@ -688,6 +825,10 @@ def train(args, device):
         # 保留已导出的尺度与 0/1 缺失标记，不再做窗口内归一化。
         "use_norm": 0,
         "patch_len": args.patch_len,
+        # 外生 token 掩码协议开关（训练/验证/测试/推理必须一致）：
+        # True = 屏蔽窗口内整段无观测的外生值 token。登记进
+        # checkpoint，predict / predict_daily 读取后自动跟随。
+        "ex_mask": bool(args.ex_mask),
     }
 
     loader_options = {
@@ -732,6 +873,7 @@ def train(args, device):
     }
 
     best = float("inf")
+    best_epoch = None
     bad_epochs = 0
     stopped_early = False
     history = []
@@ -739,9 +881,12 @@ def train(args, device):
 
     for epoch in range(1, args.epochs + 1):
         train_loss = run_epoch(
-            model, train_loader, device, optimizer=optimizer
+            model, train_loader, device, optimizer=optimizer,
+            use_ex_mask=args.ex_mask,
         )
-        val_loss = run_epoch(model, val_loader, device)
+        val_loss = run_epoch(
+            model, val_loader, device, use_ex_mask=args.ex_mask
+        )
         history.append({
             "epoch": epoch,
             "train_stock_equal_scaled_mse": train_loss,
@@ -755,6 +900,7 @@ def train(args, device):
 
         if val_loss < best:
             best = val_loss
+            best_epoch = epoch
             bad_epochs = 0
             state = {
                 **metadata,
@@ -778,24 +924,22 @@ def train(args, device):
 
     fit_finished_at = now_text()
 
-    # 训练结束、模型选定后，才执行测试预测。
-    saved = torch.load(
-        checkpoint_path, map_location="cpu", weights_only=True
-    )
-    model.load_state_dict(saved["state_dict"])
+    batches_per_epoch = len(train_loader)
+    training_stats = {
+        "n_train_samples": len(train_ds),
+        "n_train_stocks": len(train_ds.record_ids),
+        "n_val_samples": len(val_ds),
+        "n_val_stocks": len(val_ds.record_ids),
+        "batch_size": args.batch_size,
+        "batches_per_epoch": int(batches_per_epoch),
+        "completed_optimizer_steps": int(len(history) * batches_per_epoch),
+        "best_epoch_optimizer_steps": int(best_epoch * batches_per_epoch),
+    }
 
-    test_ds = PanelWindows(records, schema, "test")
-    test_loader = DataLoader(
-        test_ds, shuffle=False, **loader_options
-    )
-    frame = test_predictions(model, test_loader, records, device)
-    summary = save_test_report(frame, out)
-
-    write_json(out / "schema.json", schema)
-
-    # 选择阶段结果登记：两阶段协议中 best_epoch 是重拟合阶段的训练
-    # 预算（same_epochs 规则）；时点链用于检查"数据截止 -> 拟合完成 ->
-    # 首个预测时刻"是否可部署。
+    # 选择阶段结果登记（先落盘再测试评估）：两阶段协议中 best_epoch 是
+    # 重拟合阶段的训练预算（same_epochs 规则）；时点链用于检查
+    # "数据截止 -> 拟合完成 -> 首个预测时刻"是否可部署。预算登记在
+    # 测试评估之前完成，测试评估失败不丢预算记录。
     first_prediction = prediction_time(spec)
     selection_result = {
         "protocol": "selection_train_val_v1",
@@ -807,13 +951,19 @@ def train(args, device):
         "test_start": spec.get("test_start"),
         "epochs_limit": args.epochs,
         "patience": args.patience,
+        # 外生 token 掩码协议：refit 阶段必须与选择阶段一致（见
+        # train_refit 的一致性检查），避免"选择带掩码、重拟合不带"
+        # 的协议漂移。
+        "ex_mask": bool(args.ex_mask),
         "completed_epochs": len(history),
         "stopped_early": stopped_early,
-        "best_epoch": saved["best_epoch"],
-        "best_val_loss": saved["best_val_loss"],
+        "best_epoch": best_epoch,
+        "best_val_loss": best,
         # 重拟合训练预算规则：在更大的 Train+Val 上使用相同遍历次数
         # （相同 epoch 不等于相同更新步数，见 fit_metadata）。
         "budget_rule": "same_epochs",
+        "training_stats": training_stats,
+        "environment": environment_info(device),
         # 本阶段需要截至 val_end 的标签（训练 <= train_end、验证早停
         # <= val_end），必须赶在首个测试预测时刻之前完成。
         "fit_data_cutoff_time": f"{spec['val_end']}T15:00:00+08:00",
@@ -828,6 +978,25 @@ def train(args, device):
         ),
     }
     write_json(out / "selection_result.json", selection_result)
+    write_json(out / "schema.json", schema)
+
+    # 训练结束、模型选定后，才执行测试预测（测试集按 allow_missing 装载，
+    # 单股无测试样本只影响该股评估；整体为空说明测试块配置有问题）。
+    saved = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=True
+    )
+    model.load_state_dict(saved["state_dict"])
+
+    test_ds = PanelWindows(records, schema, "test", allow_missing=True)
+    if len(test_ds) == 0:
+        raise ValueError("整体测试集没有任何可评分样本")
+    test_loader = DataLoader(
+        test_ds, shuffle=False, **loader_options
+    )
+    frame = test_predictions(
+        model, test_loader, records, device, use_ex_mask=args.ex_mask
+    )
+    summary = save_test_report(frame, out)
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"共享 checkpoint 已保存：{checkpoint_path}")
@@ -866,6 +1035,13 @@ def train_refit(args, device):
                 f"refit 训练预算必须等于选择阶段 best_epoch="
                 f"{selection['best_epoch']}（当前 --epochs={args.epochs}）"
             )
+        if selection.get("ex_mask", False) != bool(args.ex_mask):
+            # 掩码协议必须前后一致：选择阶段与重拟合阶段的数据进入
+            # 方式（哪些外生 token 参与注意力）不能改变。
+            raise ValueError(
+                f"refit 的外生掩码协议 --ex-mask={bool(args.ex_mask)} 与"
+                f"选择阶段 ex_mask={selection.get('ex_mask', False)} 不一致"
+            )
 
     records, schema = load_catalog(
         args.data_root, expected_layout="train_test"
@@ -873,6 +1049,40 @@ def train_refit(args, device):
     train_ds = PanelWindows(records, schema, "train", layout="train_test")
     if len(train_ds) == 0:
         raise ValueError("重拟合训练集为空")
+
+    # 选择阶段产物与重拟合导出的折边界必须一致：防止把别的折/别的
+    # as-of 的 selection.json 当作本折预算来源（schema 因 enc_in 变化
+    # 可以不同，但时间边界必须重合）。
+    if selection:
+        spec_check = read_json(Path(args.data_root) / "export_config.json")
+        boundary_mismatch = []
+        if selection.get("val_end") is not None and pd.Timestamp(
+            selection["val_end"]
+        ) != pd.Timestamp(spec_check["train_end"]):
+            boundary_mismatch.append(
+                f"selection.val_end={selection.get('val_end')} != "
+                f"refit.train_end={spec_check.get('train_end')}"
+            )
+        if selection.get("as_of") is not None and str(
+            selection["as_of"]
+        ) != str(spec_check.get("as_of")):
+            boundary_mismatch.append(
+                f"selection.as_of={selection.get('as_of')} != "
+                f"refit.as_of={spec_check.get('as_of')}"
+            )
+        if selection.get("test_start") is not None and pd.Timestamp(
+            selection["test_start"]
+        ) != pd.Timestamp(spec_check["test_start"]):
+            boundary_mismatch.append(
+                f"selection.test_start={selection.get('test_start')} != "
+                f"refit.test_start={spec_check.get('test_start')}"
+            )
+        if boundary_mismatch:
+            raise ValueError(
+                "selection_result 与重拟合导出折边界不一致（"
+                + "；".join(boundary_mismatch)
+                + "）；请检查 --selection-json 是否指向本折的选择阶段产物"
+            )
 
     seq_len = train_ds.seq_len
     if args.patch_len < 1 or seq_len % args.patch_len:
@@ -899,6 +1109,9 @@ def train_refit(args, device):
         "activation": "gelu",
         "use_norm": 0,
         "patch_len": args.patch_len,
+        # 外生 token 掩码协议开关：refit 后的 checkpoint 同样登记，
+        # predict / predict_daily 读取后自动跟随。
+        "ex_mask": bool(args.ex_mask),
     }
 
     loader_options = {
@@ -950,7 +1163,8 @@ def train_refit(args, device):
     history = []
     for epoch in range(1, args.epochs + 1):
         train_loss = run_epoch(
-            model, train_loader, device, optimizer=optimizer
+            model, train_loader, device, optimizer=optimizer,
+            use_ex_mask=args.ex_mask,
         )
         history.append({
             "epoch": epoch,
@@ -963,6 +1177,14 @@ def train_refit(args, device):
         )
         write_json(out / "history.json", history)
     fit_finished_at = now_text()
+    batches_per_epoch = len(train_loader)
+    training_stats = {
+        "n_train_samples": len(train_ds),
+        "n_train_stocks": len(train_ds.record_ids),
+        "batch_size": args.batch_size,
+        "batches_per_epoch": int(batches_per_epoch),
+        "completed_optimizer_steps": int(args.epochs * batches_per_epoch),
+    }
 
     # 固定预算完成即保存最终模型：不按训练损失挑选、无早停。
     state = {
@@ -981,15 +1203,25 @@ def train_refit(args, device):
     model.load_state_dict(saved["state_dict"])
 
     # 测试块内允许个别股票无有效样本（停牌等，覆盖率不决定训练资格），
-    # 该股票不产生预测；没有任何股票有样本则属于错配。
+    # 该股票不产生预测。整体测试集为空只发生在生产全量重拟合
+    # （train_end == as_of，测试块尚无数据）：跳过测试评估、照常登记
+    # fit_metadata；此时 walk-forward 汇总不适用（本模式不产生
+    # test_predictions.csv）。
     test_ds = PanelWindows(
         records, schema, "test", layout="train_test", allow_missing=True
     )
-    if len(test_ds) == 0:
-        raise ValueError("train_test 导出在测试区间没有任何样本")
-    test_loader = DataLoader(test_ds, shuffle=False, **loader_options)
-    frame = test_predictions(model, test_loader, records, device)
-    summary = save_test_report(frame, out)
+    summary = None
+    if len(test_ds) > 0:
+        test_loader = DataLoader(test_ds, shuffle=False, **loader_options)
+        frame = test_predictions(
+            model, test_loader, records, device, use_ex_mask=args.ex_mask
+        )
+        summary = save_test_report(frame, out)
+    else:
+        print(
+            "[REFIT] 测试区间没有任何可评分样本（生产全量重拟合 "
+            "train_end == as-of），跳过测试评估"
+        )
 
     write_json(out / "schema.json", schema)
 
@@ -1009,6 +1241,8 @@ def train_refit(args, device):
             "selection_best_epoch": (
                 int(selection["best_epoch"]) if selection else None
             ),
+            # 外生 token 掩码协议（与选择阶段一致性已在前面校验）。
+            "ex_mask": bool(args.ex_mask),
             "selection_train_end": (
                 selection.get("train_end") if selection else None
             ),
@@ -1025,6 +1259,10 @@ def train_refit(args, device):
         # warm-start 预留字段：当前协议每折从头训练，无父模型。
         "parent_checkpoint": None,
         "parent_label_cutoff": None,
+        "training_stats": training_stats,
+        "environment": environment_info(device),
+        # 测试评估是否完成（生产全量重拟合 train_end == as-of 时为 False）。
+        "test_evaluated": summary is not None,
         "universe_decision_time": args.universe_decision_time,
         "universe_snapshot_hash": spec.get("universe_sha256"),
         "schema_hash": hashlib.sha256(
@@ -1061,7 +1299,8 @@ def train_refit(args, device):
     }
     write_json(out / "fit_metadata.json", fit_metadata)
 
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if summary is not None:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"重拟合 checkpoint 已保存：{checkpoint_path}")
 
 
@@ -1101,12 +1340,19 @@ def predict(args, device):
     if not np.isfinite(x).all():
         raise ValueError("推理窗口包含 NaN/Inf")
 
+    # 掩码协议跟随 checkpoint：训练时启用 ex_mask 的模型，推理时
+    # 必须同样屏蔽窗口内整段无观测的外生值 token。
+    ex_mask = None
+    if config.get("ex_mask", False):
+        ex_mask = compute_ex_mask(x, exogenous_mask_layout(saved["schema"]))
+        ex_mask = torch.from_numpy(ex_mask).to(device)
+
     model = build_model(config).to(device)
     model.load_state_dict(saved["state_dict"])
     model.eval()
 
     z = model(
-        torch.from_numpy(x).to(device), None, None, None
+        torch.from_numpy(x).to(device), None, None, None, ex_mask=ex_mask
     ).item()
     stats = prep["statistics"][TARGET]
     value = z * stats["scale"] + stats["mean"]
@@ -1144,6 +1390,16 @@ def main():
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--patch-len", type=int, default=10)
+    p.add_argument(
+        "--ex-mask",
+        action="store_true",
+        help="屏蔽窗口内整段无有效观测的外生值 token（判定只看"
+             "值列的 __missing 标记；缺失标记/年龄列本身不屏蔽）。"
+             "默认关闭＝维持既有\"填补＋缺失标记\"协议；数据集恒产出"
+             "掩码，本开关仅控制是否传入模型。启用后登记进 "
+             "checkpoint，predict / predict_daily 自动跟随；建议按"
+             "预先规定的消融实验（开 vs 关）对比后再采用",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument(

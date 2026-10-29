@@ -35,6 +35,9 @@ point-in-time（PIT）口径说明：
     - 因此 --as-of 产物是"部分 PIT"资格查询：能排除当时尚未上市的股票、
       排除当时行情/两融/百度已不满足条件的股票，但市值排名与简称映射
       仍是今天的口径；历史市值补齐前不应视为真正 PIT。
+    - 提供显式 --as-of 时，市值排名在"截至 as-of 已上市"的股票范围内
+      计算（先过滤再排名），未上市股票不占据名次槽位；缺省（最新时点）
+      不过滤上市日期。
 
 说明：
     - 本脚本只是入库数据的粗筛（快速排除明显不合格的股票）；百度/两融
@@ -114,20 +117,38 @@ def main():
             asof = explicit_asof
 
         # 市值排名仍是 stock_list 当前快照（无历史市值表，无法 PIT）；
-        # --as-of 只额外增加"截至 as-of 已上市"资格（list_date 可 PIT）。
-        stocks = con.execute(
-            f"""
-            SELECT {sql_symbol("symbol")} AS symbol, name, exchange,
-                   industry_l2, total_mv, list_date,
-                   row_number() OVER (
-                       ORDER BY total_mv DESC NULLS LAST
-                   ) AS mv_rank
-            FROM stock_list
-            QUALIFY mv_rank <= ?
-            ORDER BY mv_rank
-            """,
-            [args.top_mv],
-        ).fetchdf()
+        # --as-of 时先过滤"截至 as-of 已上市"再排名：未上市股票不应
+        # 占据 top-mv 名次槽位（否则 2025 年上市的新股会挤掉 2023 年
+        # 排名内的股票）；排名加 symbol 决胜保证确定性。
+        if explicit_asof is not None:
+            stocks = con.execute(
+                f"""
+                SELECT {sql_symbol("symbol")} AS symbol, name, exchange,
+                       industry_l2, total_mv, list_date,
+                       row_number() OVER (
+                           ORDER BY total_mv DESC NULLS LAST, symbol
+                       ) AS mv_rank
+                FROM stock_list
+                WHERE list_date IS NOT NULL AND list_date <= ?
+                QUALIFY mv_rank <= ?
+                ORDER BY mv_rank
+                """,
+                [asof, args.top_mv],
+            ).fetchdf()
+        else:
+            stocks = con.execute(
+                f"""
+                SELECT {sql_symbol("symbol")} AS symbol, name, exchange,
+                       industry_l2, total_mv, list_date,
+                       row_number() OVER (
+                           ORDER BY total_mv DESC NULLS LAST, symbol
+                       ) AS mv_rank
+                FROM stock_list
+                QUALIFY mv_rank <= ?
+                ORDER BY mv_rank
+                """,
+                [args.top_mv],
+            ).fetchdf()
         if stocks["symbol"].duplicated().any():
             raise ValueError("stock_list 标准化股票代码后存在重复")
         stocks["list_date"] = pd.to_datetime(stocks["list_date"])
@@ -199,7 +220,8 @@ def main():
 
     stages = {"top_mv": len(df)}
     if explicit_asof is not None:
-        # PIT 资格：截至 as-of 尚未上市的股票不能进入当时股票池。
+        # PIT 资格纵深防御：SQL 排名前已过滤"截至 as-of 已上市"，
+        # 这里再校验一次（防御 SQL 重构回归）。
         df = df[df["list_date"].notna() & (df["list_date"] <= asof)]
         stages["listed_by_as_of"] = len(df)
     df = df[df["span_days"].notna()]

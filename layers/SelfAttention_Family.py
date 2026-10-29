@@ -3,8 +3,40 @@ import torch.nn as nn
 import numpy as np
 from math import sqrt
 from utils.masking import TriangularCausalMask, ProbMask
-from reformer_pytorch import LSHSelfAttention
 from einops import rearrange, repeat
+
+
+def _resolve_attention_mask(attn_mask, mask_flag, batch_size, query_len, key_len, device):
+    """Resolve the mask to apply to attention scores ([B, H, L, S], True = masked).
+
+    An explicitly passed ``attn_mask`` always takes effect, regardless of ``mask_flag``.
+    ``mask_flag`` only controls whether a triangular causal mask is auto-generated when
+    no explicit mask is given (self-attention with L == S only).
+    """
+    if attn_mask is not None:
+        mask = attn_mask.mask if hasattr(attn_mask, 'mask') else attn_mask
+        if mask.dtype != torch.bool:
+            raise TypeError('attention mask must be a bool tensor where True means masked')
+        return mask.to(device=device)
+
+    if mask_flag:
+        if query_len != key_len:
+            raise ValueError(
+                'Auto triangular causal mask is only defined for self-attention (L == S); '
+                'pass an explicit mask for cross-attention.')
+        return TriangularCausalMask(batch_size, query_len, device=device).mask
+
+    return None
+
+
+def _apply_attention_mask(scores, mask, check_rows_fully_masked):
+    """Broadcast ``mask`` to ``scores`` and mask the scores in place (True = masked)."""
+    mask = torch.broadcast_to(mask, scores.shape)
+    if check_rows_fully_masked and mask.all(dim=-1).any():
+        raise ValueError(
+            'at least one query has all of its keys masked; '
+            'softmax over a fully masked row is undefined')
+    return scores.masked_fill_(mask, float('-inf'))
 
 
 class DSAttention(nn.Module):
@@ -20,7 +52,7 @@ class DSAttention(nn.Module):
     def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
         B, L, H, E = queries.shape
         _, S, _, D = values.shape
-        scale = self.scale or 1. / sqrt(E)
+        scale = self.scale if self.scale is not None else 1. / sqrt(E)
 
         tau = 1.0 if tau is None else tau.unsqueeze(
             1).unsqueeze(1)  # B x 1 x 1 x 1
@@ -30,11 +62,10 @@ class DSAttention(nn.Module):
         # De-stationary Attention, rescaling pre-softmax score with learned de-stationary factors
         scores = torch.einsum("blhe,bshe->bhls", queries, keys) * tau + delta
 
-        if self.mask_flag:
-            if attn_mask is None:
-                attn_mask = TriangularCausalMask(B, L, device=queries.device)
-
-            scores.masked_fill_(attn_mask.mask, -np.inf)
+        mask = _resolve_attention_mask(attn_mask, self.mask_flag, B, L, S, queries.device)
+        if mask is not None:
+            # the auto causal mask can never fully mask a row; only check explicit masks
+            _apply_attention_mask(scores, mask, check_rows_fully_masked=attn_mask is not None)
 
         A = self.dropout(torch.softmax(scale * scores, dim=-1))
         V = torch.einsum("bhls,bshd->blhd", A, values)
@@ -56,15 +87,14 @@ class FullAttention(nn.Module):
     def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
         B, L, H, E = queries.shape
         _, S, _, D = values.shape
-        scale = self.scale or 1. / sqrt(E)
+        scale = self.scale if self.scale is not None else 1. / sqrt(E)
 
         scores = torch.einsum("blhe,bshe->bhls", queries, keys)
 
-        if self.mask_flag:
-            if attn_mask is None:
-                attn_mask = TriangularCausalMask(B, L, device=queries.device)
-
-            scores.masked_fill_(attn_mask.mask, -np.inf)
+        mask = _resolve_attention_mask(attn_mask, self.mask_flag, B, L, S, queries.device)
+        if mask is not None:
+            # the auto causal mask can never fully mask a row; only check explicit masks
+            _apply_attention_mask(scores, mask, check_rows_fully_masked=attn_mask is not None)
 
         A = self.dropout(torch.softmax(scale * scores, dim=-1))
         V = torch.einsum("bhls,bshd->blhd", A, values)
@@ -96,7 +126,7 @@ class ProbAttention(nn.Module):
         K_sample = K_expand[:, :, torch.arange(
             L_Q).unsqueeze(1), index_sample, :]
         Q_K_sample = torch.matmul(
-            Q.unsqueeze(-2), K_sample.transpose(-2, -1)).squeeze()
+            Q.unsqueeze(-2), K_sample.transpose(-2, -1)).squeeze(-2)
 
         # find the Top_k query with sparisty measurement
         M = Q_K_sample.max(-1)[0] - torch.div(Q_K_sample.sum(-1), L_K)
@@ -130,7 +160,7 @@ class ProbAttention(nn.Module):
             attn_mask = ProbMask(B, H, L_Q, index, scores, device=V.device)
             scores.masked_fill_(attn_mask.mask, -np.inf)
 
-        attn = torch.softmax(scores, dim=-1)  # nn.Softmax(dim=-1)(scores)
+        attn = self.dropout(torch.softmax(scores, dim=-1))  # nn.Softmax(dim=-1)(scores)
 
         context_in[torch.arange(B)[:, None, None],
         torch.arange(H)[None, :, None],
@@ -159,21 +189,24 @@ class ProbAttention(nn.Module):
 
         U_part = U_part if U_part < L_K else L_K
         u = u if u < L_Q else L_Q
+        # keep at least one sampled key / top query (ceil(log(1)) == 0)
+        U_part = max(U_part, 1)
+        u = max(u, 1)
 
         scores_top, index = self._prob_QK(
             queries, keys, sample_k=U_part, n_top=u)
 
         # add scale factor
-        scale = self.scale or 1. / sqrt(D)
-        if scale is not None:
-            scores_top = scores_top * scale
+        scale = self.scale if self.scale is not None else 1. / sqrt(D)
+        scores_top = scores_top * scale
         # get the context
         context = self._get_initial_context(values, L_Q)
         # update the context with selected top_k queries
         context, attn = self._update_context(
             context, values, scores_top, index, L_Q, attn_mask)
 
-        return context.contiguous(), attn
+        # AttentionLayer expects [B, L, H, D]; context is [B, H, L, D]
+        return context.transpose(1, 2).contiguous(), attn
 
 
 class AttentionLayer(nn.Module):
@@ -208,7 +241,7 @@ class AttentionLayer(nn.Module):
             tau=tau,
             delta=delta
         )
-        out = out.view(B, L, -1)
+        out = out.reshape(B, L, -1)
 
         return self.out_projection(out), attn
 
@@ -218,6 +251,14 @@ class ReformerLayer(nn.Module):
                  d_values=None, causal=False, bucket_size=4, n_hashes=4):
         super().__init__()
         self.bucket_size = bucket_size
+        try:
+            # lazy import: models that do not use ReformerLayer (e.g. TimeXer)
+            # must not require `reformer-pytorch` to be installed
+            from reformer_pytorch import LSHSelfAttention
+        except ImportError as exc:
+            raise ImportError(
+                'ReformerLayer requires the `reformer-pytorch` package '
+                '(install it with: pip install reformer-pytorch).') from exc
         self.attn = LSHSelfAttention(
             dim=d_model,
             heads=n_heads,
@@ -232,9 +273,9 @@ class ReformerLayer(nn.Module):
         if N % (self.bucket_size * 2) == 0:
             return queries
         else:
-            # fill the time series
+            # fill the time series, keeping device and dtype of the input
             fill_len = (self.bucket_size * 2) - (N % (self.bucket_size * 2))
-            return torch.cat([queries, torch.zeros([B, fill_len, C]).to(queries.device)], dim=1)
+            return torch.cat([queries, queries.new_zeros(B, fill_len, C)], dim=1)
 
     def forward(self, queries, keys, values, attn_mask, tau, delta):
         # in Reformer: defalut queries=keys
