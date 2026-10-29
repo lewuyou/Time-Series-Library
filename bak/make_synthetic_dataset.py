@@ -210,8 +210,14 @@ def engineered_values(raw):
 
 
 def robust_stats(values):
-    """训练期 robust 标准化参数（与真实导出一致的 median/mean/scale 口径）。"""
+    """训练期 robust 标准化参数（与真实导出一致的 median/mean/scale 口径）。
+
+    nan 感知：工程特征列头部因滚动窗口未满为 NaN，统计时剔除；
+    标准化后这些位置另行填 0（=均值水平）。"""
     values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if not len(values):
+        values = np.zeros(1)
     scale = float(
         np.percentile(values, 75) - np.percentile(values, 25)
     )
@@ -240,14 +246,16 @@ def make_symbol(rng, symbol, dates, seq_len, train_end_idx, val_end_idx,
     # ---- 组装原始矩阵（值列 + 常量标记列），再做训练期标准化 ----
     columns = column_layout(base_spec)
     fit_rows = slice(0, train_end_idx + 1)  # 标准化只用训练期
+    eng = engineered_values(raw) if engineered else {}
     matrix_raw = {}
     for base, has_age in base_spec:
-        matrix_raw[base] = raw[base]
+        if base in eng:              # .get 的 fallback 是急切求值，须显式分支
+            matrix_raw[base] = eng[base]
+        else:
+            matrix_raw[base] = raw[base]
         if has_age:
             matrix_raw[base + "__age_days"] = np.full(n_days, 2.0)
         matrix_raw[base + "__missing"] = np.zeros(n_days)
-    if engineered:
-        matrix_raw.update(engineered_values(raw))
     matrix_raw[TARGET] = y
 
     statistics = {}
@@ -255,9 +263,10 @@ def make_symbol(rng, symbol, dates, seq_len, train_end_idx, val_end_idx,
     for j, col in enumerate(columns):
         stats = robust_stats(matrix_raw[col][fit_rows])
         statistics[col] = stats
-        standardized[:, j] = (
-            (matrix_raw[col] - stats["mean"]) / stats["scale"]
-        ).astype(np.float32)
+        col_std = (matrix_raw[col] - stats["mean"]) / stats["scale"]
+        # 工程特征头部 NaN（滚动窗口未满）填 0 = 均值水平，保证窗口有限。
+        col_std = np.where(np.isfinite(col_std), col_std, 0.0)
+        standardized[:, j] = col_std.astype(np.float32)
 
     # ---- 样本表：target_pos = end_pos + 1，按目标日划分 split ----
     target_stats = statistics[TARGET]
