@@ -40,17 +40,26 @@
 设计要点：
     - 每只股票独立导出、统一日期边界；特征并集 + 缺失标记由
       train_global_timexer.py 统一处理，本脚本只负责单股导出与复检。
-    - 切分口径（两种模式）：
-      1) 自动倒推（默认，与单次评估一致）：最后 test_days（默认 30）个
-         交易日为目标日的 test 集；val_end = 倒数第 test_days+1 个交易日，
-         train_end = 再往前 val_days 个交易日，保证 train/val 的输入窗口
-         与标签完全不触碰最后 30 天数据；
-      2) 显式边界（walk-forward 每折）：--as-of、--train-end、--val-end
-         必须同时提供，均为交易日历内日期且满足 train-end < val-end <
-         as-of <= 库内最新行情日；此时 --test-days/--val-days 只用于
-         登记与样本量下限校验，实际边界以显式日期为准。可选
-         --train-start 限制最早训练目标日期（rolling 训练窗口），
-         不提供时使用全部可用历史（expanding）。
+    - 切分口径（--split-layout，两种布局）：
+      1) train_val_test（默认）：
+         a. 自动倒推（与单次评估一致）：最后 test_days（默认 30）个
+            交易日为目标日的 test 集；val_end = 倒数第 test_days+1 个
+            交易日，train_end = 再往前 val_days 个交易日，保证
+            train/val 的输入窗口与标签完全不触碰最后 30 天数据；
+         b. 显式边界（walk-forward 每折）：--as-of、--train-end、
+            --val-end 必须同时提供，均为交易日历内日期且满足
+            train-end < val-end < as-of <= 库内最新行情日；此时
+            --test-days/--val-days 只用于登记与样本量下限校验，
+            实际边界以显式日期为准。可选 --train-start 限制最早
+            训练目标日期（rolling 训练窗口），不提供时使用全部可用
+            历史（expanding）；
+      2) train_test（walk-forward 两阶段协议的重拟合导出）：
+         必须显式提供 --as-of 与 --train-end（train_end 即重拟合截止日
+         fit_end，包含原验证区间的标签），不得提供 --val-end；
+         target <= train_end 全部为 train（验证集在测试开始前已成为
+         历史，可进入最终训练），target > train_end 为 test；
+         单股只强制训练样本下限，测试覆盖率登记在
+         manifest.quality.test_sample_minimum，不决定训练资格。
     - dataset.py 会按训练期覆盖率过滤特征列；本脚本导出后检查
       feature_columns 仍保留 baidu_* 与 rzrq_*，缺失者标记为
       filtered_no_baidu / filtered_no_rzrq，不进入共享训练。
@@ -68,6 +77,12 @@ walk-forward 滚动评估（第 5 步，可选）：
     调度器按交易日历生成互不重叠的测试折，每折用显式边界调用本脚本
     独立导出（独立拟合预处理），再调用 train_global_timexer.py 从头
     训练，最后拼接所有折的样本外预测。
+
+    加 --refit 启用两阶段协议（推荐对照实验）：每折先按 train_val_test
+    导出并用 Val 早停选出最佳 epoch（阶段 1 选择），再用 train_test
+    布局对截至 val_end 的 Train+Val 重新导出、重新拟合预处理并从头
+    训练固定 epoch（阶段 2 重拟合），测试块预测来自重拟合模型；
+    选择阶段的测试预测同时保留为无重拟合对照（协议 A）。
 
 注意：
     select_universe.py 的粗筛（行情天数等）不保证百度/两融各自覆盖
@@ -120,29 +135,59 @@ def parse_args():
         help="最早训练目标日期（rolling 训练窗口下限）；不提供时使用"
              "全部可用历史（expanding）",
     )
+    p.add_argument(
+        "--split-layout", choices=list(ds.SPLIT_LAYOUTS),
+        default="train_val_test",
+        help="样本划分布局：train_val_test（默认，需显式 --as-of/--train-end/"
+             "--val-end 或自动倒推）；train_test（walk-forward 重拟合导出："
+             "Train+Val 合并训练、无验证集，必须显式提供 --as-of 与 "
+             "--train-end，--train-end 即 fit_end，不得提供 --val-end）",
+    )
     return p.parse_args()
 
 
 def resolve_split(db, test_days, val_days, as_of=None, train_end=None,
-                  val_end=None, train_start=None):
+                  val_end=None, train_start=None, split_layout="train_val_test"):
     """返回 (as_of, train_end, val_end, test_start)。
 
-    与 dataset.py 同源的交易日历。两种模式：
-      - 未提供显式边界：按库内最新行情日自动倒推（与历史单次评估一致）；
-      - 显式边界：as_of/train_end/val_end 必须同时提供，均为交易日历内
-        日期且满足 train_end < val_end < as_of <= 库内最新行情日；
-        train_start 可选，限制最早训练目标日期（rolling），必须不晚于
-        train_end。
+    与 dataset.py 同源的交易日历。两种布局：
+      - train_val_test（原协议）：
+        * 未提供显式边界：按库内最新行情日自动倒推（与历史单次评估一致）；
+        * 显式边界：as_of/train_end/val_end 必须同时提供，均为交易日历内
+          日期且满足 train_end < val_end < as_of <= 库内最新行情日；
+          train_start 可选，限制最早训练目标日期（rolling），
+          必须不晚于 train_end。
+      - train_test（walk-forward 重拟合导出）：
+        * 必须显式提供 as_of 与 train_end（train_end 即 fit_end，含原
+          验证区间；生产式全量重拟合时 train_end 可等于 as_of），
+          不得提供 val_end；
+        * 满足 train_end <= as_of <= 库内最新行情日；
+        * test_start = train_end 的下一交易日（测试覆盖率为评估信息，
+          不决定训练资格，见 prepare_one）。
     """
-    explicit = [as_of, train_end, val_end]
-    if any(x is not None for x in explicit):
-        if not all(x is not None for x in explicit):
+    if split_layout not in ds.SPLIT_LAYOUTS:
+        raise ValueError(f"不支持的 split_layout：{split_layout}")
+
+    if split_layout == "train_test":
+        if val_end is not None:
+            raise ValueError("train_test 布局没有验证集，不能提供 --val-end")
+        if as_of is None or train_end is None:
             raise ValueError(
-                "显式切分必须同时提供 --as-of、--train-end、--val-end"
+                "train_test 布局必须显式提供 --as-of 与 --train-end"
+                "（--train-end 即最终训练截止日 fit_end）"
             )
         as_of = pd.Timestamp(as_of).normalize()
         train_end = pd.Timestamp(train_end).normalize()
-        val_end = pd.Timestamp(val_end).normalize()
+    else:
+        explicit = [as_of, train_end, val_end]
+        if any(x is not None for x in explicit):
+            if not all(x is not None for x in explicit):
+                raise ValueError(
+                    "显式切分必须同时提供 --as-of、--train-end、--val-end"
+                )
+            as_of = pd.Timestamp(as_of).normalize()
+            train_end = pd.Timestamp(train_end).normalize()
+            val_end = pd.Timestamp(val_end).normalize()
 
     con = duckdb.connect(db, read_only=True)
     try:
@@ -178,10 +223,19 @@ def resolve_split(db, test_days, val_days, as_of=None, train_end=None,
             ("train-end", train_end),
             ("val-end", val_end),
         ):
+            if boundary is None:
+                # train_test 布局没有验证集：val_end=None 合法且必须；
+                # 其余边界缺失才是配置错误。
+                if split_layout == "train_test" and name != "val-end":
+                    raise ValueError(f"{name} 未提供")
+                continue
             if boundary not in calendar:
                 raise ValueError(f"{name}={boundary.date()} 不在交易日历")
 
-        if not train_end < val_end < as_of:
+        if split_layout == "train_test":
+            if not train_end <= as_of:
+                raise ValueError("必须满足 train-end <= as-of")
+        elif not train_end < val_end < as_of:
             raise ValueError("必须满足 train-end < val-end < as-of")
 
         if calendar.get_loc(as_of) + 1 >= len(calendar):
@@ -196,7 +250,9 @@ def resolve_split(db, test_days, val_days, as_of=None, train_end=None,
             if start > train_end:
                 raise ValueError("train-start 不能晚于 train-end")
 
-        test_start = calendar[calendar.get_loc(val_end) + 1]
+        boundary_after_train = val_end if split_layout == "train_val_test" \
+            else train_end
+        test_start = calendar[calendar.get_loc(boundary_after_train) + 1]
         return as_of, train_end, val_end, test_start
     finally:
         con.close()
@@ -204,12 +260,18 @@ def resolve_split(db, test_days, val_days, as_of=None, train_end=None,
 
 def init_worker(db, data_root, as_of, train_end, val_end,
                 seq_len, min_train_samples, min_eval_samples,
-                train_start=None):
+                train_start=None, split_layout="train_val_test"):
     """进程级初始化：只读 duckdb 连接 + 交易日历 + 预处理配置。
 
     train_start 为 "YYYY-MM-DD" 或 None：rolling 训练窗口的最早目标日，
     传入 dataset.py 的 --start（保留原始历史用于窗口与指标预热）。
+    split_layout 见 dataset.SPLIT_LAYOUTS；train_test 时 val_end 必须为
+    None（无验证集，train_end 即重拟合截止日 fit_end）。
     """
+    if split_layout not in ds.SPLIT_LAYOUTS:
+        raise ValueError(f"不支持的 split_layout：{split_layout}")
+    if split_layout == "train_test" and val_end is not None:
+        raise ValueError("train_test 布局的 val_end 必须为 None")
     con = duckdb.connect(db, read_only=True)
     calendar, calendar_info = ds.load_calendar(
         con, None, ds.DEFAULT_CALENDAR_START, 50
@@ -240,7 +302,11 @@ def init_worker(db, data_root, as_of, train_end, val_end,
         min_market_symbols=50,
         symbol=None, industry=None, top=None, baidu_keyword=None,
         as_of=str(as_of.date()), start=train_start, tail=None,
-        train_end=str(train_end.date()), val_end=str(val_end.date()),
+        train_end=str(train_end.date()),
+        val_end=(
+            str(val_end.date()) if val_end is not None else None
+        ),
+        split_layout=split_layout,
         seq_len=seq_len, return_type="simple",
         min_train_samples=min_train_samples,
         min_eval_samples=min_eval_samples,
@@ -304,6 +370,7 @@ def export_one(row):
         if (
             prep.get("symbol") != symbol
             or prep.get("version") != ds.VERSION
+            or prep.get("split_layout", "train_val_test") != args.split_layout
             or prep.get("config") != expected_config
             or prep.get("calendar") != expected_calendar
             or prep.get("min_feature_coverage") != args.min_feature_coverage
@@ -352,10 +419,16 @@ def main():
         raise ValueError("数量参数必须为正数")
     if a.seq_len < 2:
         raise ValueError("--seq-len 必须 >= 2")
-    if min(a.test_days, a.val_days) < a.min_eval_samples:
-        # 只是必要条件：停牌等情况仍可能导致单股有效样本不足，
-        # 最终由 prepare_one() 判断。
-        raise ValueError("test-days 和 val-days 不能小于 min-eval-samples")
+    # train_test 布局没有验证区间：val-days 不参与校验；test-days 只是
+    # 必要条件（显式边界以日期为准，单股由 prepare_one() 判断）。
+    eval_days_floor = (
+        a.test_days if a.split_layout == "train_test"
+        else min(a.test_days, a.val_days)
+    )
+    if eval_days_floor < a.min_eval_samples:
+        raise ValueError("测试/验证块长度不能小于 min-eval-samples")
+    if a.split_layout == "train_test" and a.val_end:
+        raise ValueError("train_test 布局没有验证集，不能提供 --val-end")
 
     rows = pd.read_csv(
         a.universe_csv, dtype={"symbol": str}
@@ -370,7 +443,7 @@ def main():
     as_of, train_end, val_end, test_start = resolve_split(
         a.db, a.test_days, a.val_days,
         as_of=a.as_of, train_end=a.train_end, val_end=a.val_end,
-        train_start=a.train_start,
+        train_start=a.train_start, split_layout=a.split_layout,
     )
     # 统一为 "YYYY-MM-DD"，与 preprocessing.json 的 sample_selection 一致。
     train_start = (
@@ -382,11 +455,14 @@ def main():
     root.mkdir(parents=True, exist_ok=True)
 
     spec = {
-        "export_version": "global_export_wf_v1",
+        "export_version": "global_export_wf_v2",
+        "split_layout": a.split_layout,
         "db": str(Path(a.db).resolve()),
         "as_of": str(as_of.date()),
         "train_end": str(train_end.date()),
-        "val_end": str(val_end.date()),
+        "val_end": (
+            str(val_end.date()) if val_end is not None else None
+        ),
         "test_start": str(test_start.date()),
         "train_start": train_start,
         "seq_len": a.seq_len,
@@ -433,6 +509,7 @@ def main():
             a.min_train_samples,
             a.min_eval_samples,
             train_start,
+            a.split_layout,
         ),
     ) as pool:
         futures = {

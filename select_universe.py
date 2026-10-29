@@ -6,15 +6,35 @@
         --out dataset/global_001/universe.csv \
         --top-mv 3000 --min-years 3 --baidu-fresh-days 30
 
+    walk-forward / 历史回测按当时时点粗筛（部分 point-in-time）：
+    python select_universe.py --db ... --out ... --as-of 2024-01-02
+
 入选要求（对应需求）：
     1. 市值排在前 --top-mv 位（默认 3000，按 stock_list.total_mv 降序）；
     2. 辅助数据里有百度数据：baidu 表中存在 keyword = 当前股票简称 的记录，
-       且仍在更新（最新观测日距库内最新行情日不超过 --baidu-fresh-days）；
+       且仍在更新（最新观测日距 as-of 日不超过 --baidu-fresh-days）；
     3. 辅助数据里有两融数据：rzrq 表中存在该股票记录；
     4. 总数据量不小于 --min-years 年（默认 3 年）：后复权行情
        跨度 >= 365*min-years 天 且 有行情记录的不同日期数量
        （count(DISTINCT date)）>= 244*min-years 天。
        SQL 未逐行验证 OHLC 是否有效，真正的行情有效性由 dataset.py 判断。
+    5. （提供 --as-of 时）截至 as-of 已上市（stock_list.list_date <= as-of）。
+
+point-in-time（PIT）口径说明：
+    - 库内没有历史市值、历史简称、历史上市/退市快照，本脚本的 PIT 能力
+      是部分实现，必须区分两类资格条件：
+      * 可按时点评估（提供 --as-of 时按 as-of 日重算）：
+        上市日期（list_date <= as-of）、行情历史/跨度/交易日数
+        （date <= as-of）、两融是否存在当时记录（date <= as-of）、
+        百度数据截至 as-of 是否仍新鲜（max(date) <= as-of 的部分）；
+      * 仍是当前快照（无法 PIT，明确保留限制）：
+        市值排名 top_mv（total_mv 是 stock_list 当前快照）、
+        百度关键词 = 当前简称（name 是当前快照）、industry_l2 当前分类；
+        且 stock_list 本身是当前在市股票清单，历史已退市股票天然缺失
+        （快照层面的幸存者偏差）。
+    - 因此 --as-of 产物是"部分 PIT"资格查询：能排除当时尚未上市的股票、
+      排除当时行情/两融/百度已不满足条件的股票，但市值排名与简称映射
+      仍是今天的口径；历史市值补齐前不应视为真正 PIT。
 
 说明：
     - 本脚本只是入库数据的粗筛（快速排除明显不合格的股票）；百度/两融
@@ -52,7 +72,13 @@ def parse_args():
     p.add_argument("--min-years", type=float, default=3.0, help="最少历史年限")
     p.add_argument(
         "--baidu-fresh-days", type=int, default=30,
-        help="百度关键词最新观测日距库内最新行情日的最大天数",
+        help="百度关键词最新观测日距 as-of 日的最大天数",
+    )
+    p.add_argument(
+        "--as-of", default=None,
+        help="按历史时点粗筛的日期（YYYY-MM-DD）：上市日期、行情/两融/"
+             "百度历史均按 <= as-of 重算；市值排名与简称仍是当前快照"
+             "（部分 PIT，见模块说明）。缺省 = 库内最新行情日（当前行为）",
     )
     return p.parse_args()
 
@@ -64,19 +90,35 @@ def main():
     if args.baidu_fresh_days < 0:
         raise ValueError("--baidu-fresh-days 必须 >= 0")
 
+    explicit_asof = None
+    if args.as_of:
+        explicit_asof = pd.Timestamp(args.as_of).normalize()
+
     con = duckdb.connect(args.db, read_only=True)
     try:
-        asof = con.execute(
+        latest = con.execute(
             "SELECT max(date) FROM akshare_tx WHERE adjust='hfq'"
         ).fetchone()[0]
-        if asof is None:
+        if latest is None:
             raise ValueError("数据库没有后复权行情")
-        asof = pd.Timestamp(asof).normalize()
+        latest = pd.Timestamp(latest).normalize()
 
+        if explicit_asof is None:
+            asof = latest
+        else:
+            if explicit_asof > latest:
+                raise ValueError(
+                    f"--as-of {explicit_asof.date()} 晚于库内最新行情日 "
+                    f"{latest.date()}"
+                )
+            asof = explicit_asof
+
+        # 市值排名仍是 stock_list 当前快照（无历史市值表，无法 PIT）；
+        # --as-of 只额外增加"截至 as-of 已上市"资格（list_date 可 PIT）。
         stocks = con.execute(
             f"""
             SELECT {sql_symbol("symbol")} AS symbol, name, exchange,
-                   industry_l2, total_mv,
+                   industry_l2, total_mv, list_date,
                    row_number() OVER (
                        ORDER BY total_mv DESC NULLS LAST
                    ) AS mv_rank
@@ -88,16 +130,19 @@ def main():
         ).fetchdf()
         if stocks["symbol"].duplicated().any():
             raise ValueError("stock_list 标准化股票代码后存在重复")
+        stocks["list_date"] = pd.to_datetime(stocks["list_date"])
 
+        # 行情/两融/百度历史均可按时点重算：date <= as-of。
         quotes = con.execute(
             f"""
             SELECT {sql_symbol("symbol")} AS symbol,
                    count(DISTINCT date) AS quote_days,
                    min(date) AS first_quote, max(date) AS last_quote
             FROM akshare_tx
-            WHERE adjust = 'hfq'
+            WHERE adjust = 'hfq' AND date <= ?
             GROUP BY 1
-            """
+            """,
+            [asof],
         ).fetchdf()
         quotes["first_quote"] = pd.to_datetime(quotes["first_quote"])
         quotes["last_quote"] = pd.to_datetime(quotes["last_quote"])
@@ -110,8 +155,10 @@ def main():
             SELECT {sql_symbol("code")} AS symbol,
                    count(*) AS rzrq_rows, max(date) AS rzrq_last
             FROM rzrq
+            WHERE date <= ?
             GROUP BY 1
-            """
+            """,
+            [asof],
         ).fetchdf()
 
         baidu = con.execute(
@@ -121,8 +168,10 @@ def main():
             FROM baidu
             WHERE source IN ('search_all', 'feed')
               AND value IS NOT NULL
+              AND date <= ?
             GROUP BY 1
-            """
+            """,
+            [asof],
         ).fetchdf()
     finally:
         con.close()
@@ -149,6 +198,10 @@ def main():
     )
 
     stages = {"top_mv": len(df)}
+    if explicit_asof is not None:
+        # PIT 资格：截至 as-of 尚未上市的股票不能进入当时股票池。
+        df = df[df["list_date"].notna() & (df["list_date"] <= asof)]
+        stages["listed_by_as_of"] = len(df)
     df = df[df["span_days"].notna()]
     stages["has_quotes"] = len(df)
 
@@ -170,7 +223,7 @@ def main():
     df = df.sort_values("mv_rank").reset_index(drop=True)
     out_cols = [
         "symbol", "name", "exchange", "industry_l2", "total_mv", "mv_rank",
-        "quote_days", "first_quote", "last_quote", "span_days",
+        "list_date", "quote_days", "first_quote", "last_quote", "span_days",
         "baidu_days", "baidu_last", "rzrq_rows", "rzrq_last",
     ]
     df = df[out_cols]
@@ -182,6 +235,7 @@ def main():
     meta = {
         "db": str(Path(args.db).resolve()),
         "as_of": str(asof.date()),
+        "as_of_explicit": explicit_asof is not None,
         "criteria": {
             "top_mv": args.top_mv,
             "min_years": args.min_years,
@@ -189,11 +243,44 @@ def main():
             "min_quote_days": min_days,
             "baidu_fresh_days": args.baidu_fresh_days,
         },
+        # PIT 能力分类：明确区分可按时点评估与仍是当前快照的条件，
+        # 避免"部分 PIT"被误当成真正 PIT 使用。
+        "pit_status": {
+            "pit_criteria": [
+                "listed_by_as_of" if explicit_asof is not None else None,
+                "quote_history_span_days",
+                "quote_days",
+                "has_rzrq",
+                "has_fresh_baidu",
+            ],
+            "snapshot_criteria": [
+                "top_mv_rank",
+                "baidu_keyword_name_mapping",
+                "industry_l2",
+                "stock_list_membership",
+            ],
+            "limitations": [
+                "库内没有历史市值表：total_mv 排名是 stock_list 当前快照",
+                "库内没有历史简称表：百度关键词按当前简称匹配",
+                "stock_list 是当前在市清单：历史已退市股票天然缺失"
+                "（快照层面幸存者偏差）",
+                "无辅助数据发布时间（published_at/first_seen_at），"
+                "行情/两融/百度按观测日 <= as-of 近似 PIT",
+            ],
+        },
         "stages": stages,
         "selected": len(df),
         "created_at": pd.Timestamp.now(tz="Asia/Shanghai").isoformat(),
     }
-    json_write(out.with_name("universe_meta.json"), meta)
+    if explicit_asof is None:
+        meta["pit_status"]["pit_criteria"] = [
+            c for c in meta["pit_status"]["pit_criteria"]
+            if c is not None
+        ]
+    # meta 文件名跟随 CSV stem：缺省 universe.csv -> universe_meta.json
+    # （与历史一致）；walk-forward 每折多套股票池（universe_selection/
+    # universe_refit）的 meta 互相不覆盖。
+    json_write(out.with_name(f"{out.stem}_meta.json"), meta)
 
     print(f"as_of={asof.date()} | 筛选漏斗：{json.dumps(stages, ensure_ascii=False)}")
     print(f"[OK] 入选 {len(df)} 只股票 -> {out}")

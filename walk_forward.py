@@ -2,19 +2,54 @@
 """最小 walk-forward 滚动评估调度器（完整流程第 5 步，可选）。
 
 协议（尽量复用现有导出与训练脚本，不改动其核心逻辑）：
+
+[默认：无重拟合协议 A，independent_train_val_test_v1]
     每折：独立导出 → 独立拟合预处理（特征筛选/填补/scaler）→
           从头初始化模型 → Train 训练 → Val 早停选 checkpoint →
           对紧随其后的 Test 块逐日一步预测。
 
+[--refit：两阶段协议 B，train_val_refit_v1，推荐对照实验]
+    每折拆成"选择"与"重拟合"两个阶段（设训练截止日 A、验证截止日
+    B、测试截止日 C）：
+    阶段 1 选择：Train <= A 训练、A~B 验证早停选出 best_epoch
+        （train_val_test 导出、独立预处理 P_select）；
+    阶段 2 重拟合：train_test 导出（fit_end=B，含原验证区间标签）、
+        独立重新拟合预处理 P_refit（Train+Val 上重算特征覆盖率/保留列/
+        填补/scaler/目标标准化/schema）、从头初始化、训练固定
+        best_epoch 个 epoch（same_epochs 预算规则）、无验证集、无早停、
+        完成预算后保存最终模型；
+    阶段 3 样本外：测试块 B~C 由重拟合模型逐日预测（参数冻结，测试块
+        内可使用已发生的测试期行情作为输入）。
+    验证集可以进入最终训练，因为它在测试开始前已是历史；测试集仍不
+    参与任何训练期决策。选择阶段的测试预测同时保留为协议 A 对照
+    （oos/selection_control/），两协议使用完全相同的 OOS 日期。
+    same_epochs 语义：相同 epoch 数在扩大后的数据集上意味着每个
+    epoch 的 batch 数增加、优化器更新步数更多；不用后面折的结果调整
+    前面折的训练预算。跨折 warm-start 不在本协议内（见"已知局限"）。
+
+[--pit-universe：每折部分 PIT 股票池]
+    每折调用 select_universe.py --as-of 独立生成股票池：选择阶段按
+    A 时点、重拟合阶段按 B 时点重新确定资格（U_select 与 U_refit 可
+    不同）。可按时点评估的资格项：上市日期、行情历史、两融/百度历史；
+    市值排名与简称映射仍是当前快照（部分 PIT，详见 select_universe.py）。
+    测试块内不新增股票；按当时交易状态与输入有效性决定是否发信号。
+    不要根据测试期表现或数据完整性回头筛股票。
+
+通用约束：
     - 测试块互不重叠，滚动步长等于测试块长度（--test-days）；
     - expanding（默认）：训练目标日为日历起点至本折 train-end 的全部
       可用历史；rolling（--train-days N）：限制为最近 N 个候选训练
       目标交易日（不保证每只股票有 N 个有效样本，单股下限由
       --min-train-samples 兜底）；
+    - --refit-window-policy：extend_to_val_end（默认，训练起点不变、
+      终点延伸至 B，即真正的 Train+Val 合并）；keep_train_days（终点
+      延伸至 B、起点同步后移，保持最近 --train-days 个训练日；需要
+      --train-days）；
     - 尾部不足一个完整测试块的日期直接跳过（第一版不做部分折）；
-    - 测试块内模型参数固定，后面的测试日可以使用此前已经发生的
-      测试期行情作为输入（与 PanelWindows 行为一致），不是在测试块
-      开始时一次性预测整个未来；
+    - 测试块内模型参数固定（选择阶段用 best checkpoint、重拟合阶段
+      用完成预算后的最终 checkpoint），后面的测试日可以使用此前已经
+      发生的测试期行情作为输入（与 PanelWindows 行为一致），不是在
+      测试块开始时一次性预测整个未来；
     - 单折导出的断点恢复（export_config.json 一致性复检）仍然保留；
       调度层不实现断点恢复，中断后请换新的 --run-root 重跑。
 
@@ -25,41 +60,63 @@
 
 数据库快照约束：
     运行期间数据库必须保持不变（建议固定快照，不要让采集任务继续
-    更新同一份库）。每折导出前校验最新行情日与截至该日的交易日历
-    指纹，与启动时不一致即硬失败，避免前后折混用不同版本的历史。
+    更新同一份库）。每折各阶段导出前校验最新行情日与截至该日的交易日
+    历指纹，与启动时不一致即硬失败，避免前后折混用不同版本的历史。
     该检查不能发现不改变日期的历史数值修订，完整保证仍需固定快照
     （配置和脚本哈希不能替代数据快照）。
 
 输出（--run-root）：
     walk_forward_plan.json     协议、参数、折边界、数据库与脚本指纹
-    folds.csv                  逐折日期边界表
-    fold_metrics.json          各折 test_metrics.json 汇总
-    oos_summary.json           拼接后样本外总指标（原始收益率尺度）
-    data/<fold_id>/            每折导出目录（export_global.py 输出）
-    checkpoints/<fold_id>/     每折训练输出（train_global_timexer.py）
-    oos/test_predictions.csv   所有折样本外预测合集，附 fold_id 与该折
-                               train_start/train_end/val_end，可追溯每条
-                               预测来自哪个训练版本
+    folds.csv                  逐折日期边界表（--refit 时含 refit_train_start）
+    fold_metrics.json          各折 test_metrics.json 汇总（--refit 时
+                               分 selection/refit 两阶段嵌套）
+    oos_summary.json           拼接后样本外总指标（原始收益率尺度）；
+                               --refit 时含重拟合/选择对照/公共样本诊断
+    fit_timing.csv             （--refit）各阶段"数据截止 -> 拟合起止 ->
+                               首个预测时刻"时点链登记
+    data/<fold_id>/            每折导出目录（export_global.py 输出；
+                               --refit 时分 selection/ 与 refit/ 两套）
+    data/<fold_id>/pit_universes.json（--pit-universe）每折股票池资格
+                               时点、路径与哈希
+    checkpoints/<fold_id>/     每折训练输出（--refit 时分 selection/ 与
+                               refit/：checkpoint、selection_result.json、
+                               fit_metadata.json）
+    oos/test_predictions.csv   所有折样本外预测合集（--refit 时来自重拟合
+                               模型），附 fold_id 与该折训练边界，可追溯
+                               每条预测来自哪个训练版本
+    oos/selection_control/     （--refit）协议 A 对照：选择阶段测试预测
+                               与指标
+    oos/comparison.json         并入 oos_summary.json（--refit）
     oos/test_metrics.json      拼接后总指标
     oos/test_metrics_by_stock.csv
 
 已知局限（在单次评估基础上新增/放大，详见 train_global_timexer.py）：
     1. 固定输入 universe.csv 属于条件性历史评估：股票池由当前市值、
        当前存续名单、当前简称等决定，walk-forward 不能解决股票池的
-       point-in-time 问题；
-    2. 每折模型参数截至 train_end，Val 仅用于选择 epoch，与"每月用
-       截至昨天的全部标签重训"的部署方式不同；
-    3. 每折实际入模股票可能因训练期辅助数据覆盖不同而变化
+       point-in-time 问题；--pit-universe 只是部分 PIT（市值排名与
+       简称映射仍是当前快照），历史市值/简称补齐前不应视为真正 PIT；
+    2. 无重拟合协议的参数截至 train_end，Val 仅用于选 epoch；重拟合
+       协议通过 Train+Val refit 缓解，但 same_epochs 预算下相同 epoch
+       意味着更多优化器更新步数（已知语义，不是等量更新）；
+    3. fit_timing 的 would_meet_first_prediction_deadline 只是离线
+       回测的墙上时钟记录，不能证明当时能按时完成（采集延迟、算力
+       差异都未建模）；
+    4. 每折实际入模股票可能因训练期辅助数据覆盖不同而变化
        （filtered_no_baidu / filtered_no_rzrq），差异按折记录在
        data/<fold_id>/export_results.csv；不要事后取所有折都成功的
        股票交集重训，否则重新引入未来筛选；
-    4. 评估仍是统计口径收益率，不是可实现交易收益；
-    5. --min-eval-samples >= --test-days 时要求每只股票测试块内全部
+    5. 评估仍是统计口径收益率，不是可实现交易收益；
+    6. --min-eval-samples >= --test-days 时要求每只股票测试块内全部
        交易日有效（例如 20/20），约束严格；可事先统一选择较低下限
-       （如 10），但不能看完某折结果后再有针对性地调整。
+       （如 10），但不能看完某折结果后再有针对性地调整。重拟合导出
+       （train_test）中测试覆盖率只登记不强制，不决定训练资格；
+    7. 跨折 warm-start 未实现，保留为独立实验：1) 每折重新拟合每股
+       scaler/schema/特征保留列后，上一折权重不能当作无条件兼容的
+       连续训练状态；2) 上一折最终模型可能已见过本折验证窗口标签，
+       不能直接用于本折早停选择。
 
 运行示例：
-    # expanding
+    # expanding，无重拟合（协议 A）
     python walk_forward.py \
         --db ../AutoTS/download/autots.duckdb \
         --universe-csv dataset/global_001/universe.csv \
@@ -71,8 +128,21 @@
         --batch-size 256 --loader-workers 0 \
         --d-model 64 --e-layers 2 --patch-len 10 --device auto
 
-    # rolling 对照（最近约三年训练标签）：增加 --train-days 732，
-    # 并使用新的 --run-root runs/wf_rolling_732_001
+    # 两阶段协议（协议 B），rolling 对照（最近约三年训练标签）：
+    # 增加 --train-days 732 --refit，并使用新的 --run-root
+    python walk_forward.py \
+        --db ../AutoTS/download/autots.duckdb \
+        --universe-csv dataset/global_001/universe.csv \
+        --run-root runs/wf_refit_rolling_732_001 \
+        --first-test-date 2024-01-02 --last-test-date 2024-12-31 \
+        --val-days 60 --test-days 20 --seq-len 60 --train-days 732 \
+        --refit --refit-window-policy extend_to_val_end \
+        --min-train-samples 250 --min-eval-samples 20 \
+        --export-workers 4 --epochs 30 --patience 5 \
+        --batch-size 256 --loader-workers 0 --device auto
+
+    # 每折部分 PIT 股票池（选择按 A 时点、重拟合按 B 时点）：
+    # 用 --pit-universe 替代 --universe-csv，并可调 --pit-top-mv 等
 """
 
 import argparse
@@ -114,9 +184,28 @@ def read_db_state(con, calendar):
     }
 
 
+def ensure_db_state(con, calendar, baseline_state, stage_label):
+    """各阶段导出前的数据库快照守护：追加行情或日历变化即硬失败。"""
+    current_state = read_db_state(con, calendar)
+    if current_state != baseline_state:
+        raise ValueError(
+            f"数据库在运行期间发生变化（{stage_label}：最新行情日或"
+            "交易日历指纹不一致）；请使用固定数据库快照，并换新的 "
+            "run-root 重跑"
+        )
+
+
 def build_folds(calendar, first_test_date, last_test_date, val_days,
-                test_days, train_days=None):
-    """仅生成完整测试块；train_days=None 表示 expanding。"""
+                test_days, train_days=None, refit=False,
+                refit_window_policy="extend_to_val_end"):
+    """仅生成完整测试块；train_days=None 表示 expanding。
+
+    refit=True 时同时给出每折重拟合训练窗口起点 refit_train_start：
+      extend_to_val_end：与选择阶段训练起点一致，终点延伸至 B
+        （真正的 Train+Val 合并；expanding 时仍为 None）；
+      keep_train_days：终点为 B、起点后移，保持最近 train_days 个
+        训练目标日（"用验证定预算，再用截至 B 的最近 N 日训练"）。
+    """
     calendar = pd.DatetimeIndex(calendar).normalize()
     first = pd.Timestamp(first_test_date).normalize()
     last = pd.Timestamp(last_test_date).normalize()
@@ -147,7 +236,7 @@ def build_folds(calendar, first_test_date, last_test_date, val_days,
                 raise ValueError("首折不足指定 rolling 训练长度")
             train_start = date_text(calendar[train_start_pos])
 
-        folds.append({
+        fold = {
             "fold_id": f"fold_{len(folds):03d}",
             "train_start": train_start,
             "train_end": date_text(calendar[train_end_pos]),
@@ -156,7 +245,25 @@ def build_folds(calendar, first_test_date, last_test_date, val_days,
             "as_of": date_text(calendar[test_end_pos]),
             "val_days": val_days,
             "test_days": test_days,
-        })
+        }
+
+        if refit:
+            if refit_window_policy == "keep_train_days":
+                if train_days is None:
+                    raise ValueError(
+                        "refit-window-policy=keep_train_days 需要 --train-days"
+                    )
+                refit_start_pos = val_end_pos - train_days + 1
+                if refit_start_pos < 0:
+                    raise ValueError("首折不足指定 rolling 重拟合训练长度")
+                fold["refit_train_start"] = date_text(
+                    calendar[refit_start_pos]
+                )
+            else:
+                # extend_to_val_end：起点与选择阶段一致，终点延伸至 B。
+                fold["refit_train_start"] = train_start
+
+        folds.append(fold)
 
         begin += test_days
 
@@ -171,6 +278,207 @@ def run_command(command):
     subprocess.run(command, check=True)
 
 
+def export_command(a, db, universe, data_root, fold, layout,
+                  train_end, val_end=None, train_start_key="train_start"):
+    """构造 export_global.py 命令（显式日期边界）。"""
+    command = [
+        sys.executable,
+        str(SCRIPT_DIR / "export_global.py"),
+        "--db", db,
+        "--universe-csv", str(universe),
+        "--data-root", str(data_root),
+        "--workers", str(a.export_workers),
+        "--seq-len", str(a.seq_len),
+        "--test-days", str(a.test_days),
+        "--val-days", str(a.val_days),
+        "--min-train-samples", str(a.min_train_samples),
+        "--min-eval-samples", str(a.min_eval_samples),
+        "--as-of", fold["as_of"],
+        "--split-layout", layout,
+        "--train-end", train_end,
+    ]
+    if val_end is not None:
+        command += ["--val-end", val_end]
+
+    train_start = fold.get(train_start_key)
+    if train_start is not None:
+        command += ["--train-start", train_start]
+
+    return command
+
+
+def train_command(a, data_root, out_dir, mode, epochs=None, extra=None):
+    """构造 train_global_timexer.py 命令（共享模型参数一份）。"""
+    command = [
+        sys.executable,
+        str(SCRIPT_DIR / "train_global_timexer.py"),
+        "--mode", mode,
+        "--data-root", str(data_root),
+        "--out-dir", str(out_dir),
+        "--batch-size", str(a.batch_size),
+        "--workers", str(a.loader_workers),
+        "--d-model", str(a.d_model),
+        "--e-layers", str(a.e_layers),
+        "--n-heads", str(a.n_heads),
+        "--patch-len", str(a.patch_len),
+        "--lr", str(a.lr),
+        "--dropout", str(a.dropout),
+        "--weight-decay", str(a.weight_decay),
+        "--seed", str(a.seed),
+        "--device", a.device,
+    ]
+    if epochs is not None:
+        command += ["--epochs", str(epochs)]
+    if mode == "train":
+        command += ["--patience", str(a.patience)]
+    if extra:
+        command += list(extra)
+    return command
+
+
+def verify_export_config(data_root, expected, stage_label):
+    """折边界登记复核：导出登记必须与调度计划完全一致。"""
+    exported = json.loads(
+        (Path(data_root) / "export_config.json").read_text(encoding="utf-8")
+    )
+    for key, value in expected.items():
+        if exported.get(key) != value:
+            raise ValueError(
+                f"{stage_label}: 导出登记 {key}={exported.get(key)} "
+                f"与计划 {value} 不一致"
+            )
+    return exported
+
+
+def load_fold_predictions(out_dir):
+    """读取单折测试预测。"""
+    return pd.read_csv(
+        Path(out_dir) / "test_predictions.csv", dtype={"symbol": str}
+    )
+
+
+def run_pit_universe(a, db, out_path, as_of, stage_label):
+    """调用 select_universe.py 按历史时点生成部分 PIT 股票池。"""
+    command = [
+        sys.executable,
+        str(SCRIPT_DIR / "select_universe.py"),
+        "--db", db,
+        "--out", str(out_path),
+        "--as-of", date_text(as_of),
+        "--top-mv", str(a.pit_top_mv),
+        "--min-years", str(a.pit_min_years),
+        "--baidu-fresh-days", str(a.pit_baidu_fresh_days),
+    ]
+    run_command(command)
+    frame = pd.read_csv(out_path, dtype={"symbol": str})
+    if frame.empty:
+        raise ValueError(
+            f"{stage_label}: --as-of {date_text(as_of)} 生成的股票池为空"
+        )
+    return {
+        "path": str(out_path),
+        "as_of": date_text(as_of),
+        "rows": len(frame),
+        "sha256": ds.sha256_file(out_path),
+    }
+
+
+def check_fold_frame(frame, fold, fold_id, stage_label):
+    """测试预测日期边界与唯一性校验。"""
+    target_dates = pd.to_datetime(frame["target_date"])
+    inside = (
+        target_dates.ge(pd.Timestamp(fold["test_start"]))
+        & target_dates.le(pd.Timestamp(fold["as_of"]))
+    )
+    if frame.empty or not inside.all():
+        raise ValueError(f"{fold_id}/{stage_label}: 测试预测为空或日期越界")
+
+    if frame.duplicated(["symbol", "target_date"]).any():
+        raise ValueError(f"{fold_id}/{stage_label}: 单折预测存在重复")
+
+
+def protocol_comparison(control, treatment):
+    """协议 A（选择阶段直出）与协议 B（Train+Val 重拟合）的诊断对照。
+
+    只在公共 (symbol, target_date) 上对比模型误差与日度 RankIC，
+    并报告覆盖差异；公共样本对照仅用于诊断协议差异，不能替代
+    完整流程结果（两协议各自完整覆盖结果才是主要指标）。
+    """
+    keys = ["symbol", "target_date"]
+    left = control[keys + ["y_true", "y_pred"]].rename(
+        columns={"y_true": "y_true_selection", "y_pred": "y_pred_selection"}
+    )
+    right = treatment[keys + ["y_true", "y_pred"]].rename(
+        columns={"y_true": "y_true_refit", "y_pred": "y_pred_refit"}
+    )
+    merged = left.merge(right, on=keys, validate="one_to_one")
+
+    if not merged.empty:
+        drift = (
+            merged["y_true_selection"] - merged["y_true_refit"]
+        ).abs().max()
+        if drift > 1e-8:
+            raise ValueError(
+                "两协议同一 (symbol, target_date) 的 y_true 不一致"
+                "（最大差异 %.3e）：数据库可能在运行期间被修订" % drift
+            )
+
+    def pooled(pred_col):
+        if merged.empty:
+            return None
+        err = merged[pred_col] - merged["y_true_refit"]
+        return {
+            "mse": float((err ** 2).mean()),
+            "mae": float(err.abs().mean()),
+        }
+
+    def daily_rank_ic(pred_col):
+        if merged.empty:
+            return None
+        grouped = merged.groupby("target_date")
+        per_day = []
+        for _, day in grouped:
+            if len(day) < 3 or day[pred_col].nunique() < 2:
+                continue
+            per_day.append(
+                float(day[pred_col].rank().corr(day["y_true_refit"].rank()))
+            )
+        return float(pd.Series(per_day).mean()) if per_day else None
+
+    def coverage(frame):
+        return {
+            "rows": int(len(frame)),
+            "stocks": int(frame["symbol"].nunique()) if len(frame) else 0,
+            "dates": (
+                int(pd.to_datetime(frame["target_date"]).nunique())
+                if len(frame) else 0
+            ),
+        }
+
+    return {
+        "note": (
+            "公共样本对照仅用于诊断；主要结论以 oos/test_metrics.json"
+            "（协议 B）与 oos/selection_control（协议 A）的完整覆盖"
+            "结果为准"
+        ),
+        "coverage": {
+            "selection": coverage(control),
+            "refit": coverage(treatment),
+            "common": coverage(merged),
+        },
+        "common_subset": {
+            "selection_y_pred": {
+                "pooled": pooled("y_pred_selection"),
+                "daily_rank_ic": daily_rank_ic("y_pred_selection"),
+            },
+            "refit_y_pred": {
+                "pooled": pooled("y_pred_refit"),
+                "daily_rank_ic": daily_rank_ic("y_pred_refit"),
+            },
+        },
+    }
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -178,7 +486,22 @@ def parse_args():
     )
 
     p.add_argument("--db", default=ds.DEFAULT_DB)
-    p.add_argument("--universe-csv", required=True)
+    p.add_argument(
+        "--universe-csv",
+        help="固定输入股票池 CSV；与 --pit-universe 互斥",
+    )
+    p.add_argument(
+        "--pit-universe", action="store_true",
+        help="每折调用 select_universe.py --as-of 独立生成部分 PIT 股票池"
+             "（选择阶段按 train_end 时点、重拟合阶段按 val_end 时点；"
+             "市值排名与简称映射仍是当前快照，见 select_universe.py）",
+    )
+    p.add_argument("--pit-top-mv", type=int, default=3000,
+                   help="--pit-universe 时的市值排名上限")
+    p.add_argument("--pit-min-years", type=float, default=3.0,
+                   help="--pit-universe 时的最少历史年限")
+    p.add_argument("--pit-baidu-fresh-days", type=int, default=30,
+                   help="--pit-universe 时的百度数据新鲜度要求（天）")
     p.add_argument("--run-root", required=True)
 
     p.add_argument("--first-test-date", required=True)
@@ -191,18 +514,36 @@ def parse_args():
         help="rolling 训练目标交易日数；不传为 expanding",
     )
 
+    p.add_argument(
+        "--refit", action="store_true",
+        help="启用两阶段协议：Train+Val 重拟合（推荐与缺省协议对照）；"
+             "验证集在测试开始前成为历史，可进入最终训练",
+    )
+    p.add_argument(
+        "--refit-window-policy",
+        choices=["extend_to_val_end", "keep_train_days"],
+        default="extend_to_val_end",
+        help="重拟合训练窗口策略：extend_to_val_end=训练起点不变、终点"
+             "延伸至 val_end（真正的 Train+Val 合并，expanding 时仍为"
+             "全部历史）；keep_train_days=终点为 val_end、起点后移，保持"
+             "最近 --train-days 个训练日",
+    )
+
     p.add_argument("--seq-len", type=int, default=60)
     p.add_argument("--min-train-samples", type=int, default=250)
     p.add_argument(
         "--min-eval-samples", type=int, default=20,
         help="单股每折 val/test 有效样本下限；等于 test-days 时要求测试块"
              "内全部交易日有效，可事先统一选择较低下限（如 10），但不能"
-             "看完某折结果后再调整",
+             "看完某折结果后再调整；重拟合导出（train_test）中测试"
+             "覆盖率只登记不强制，不决定训练资格",
     )
     p.add_argument("--export-workers", type=int, default=4)
 
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--patience", type=int, default=5)
+    p.add_argument("--epochs", type=int, default=30,
+                   help="选择阶段早停上限；重拟合阶段固定预算=各折 best_epoch")
+    p.add_argument("--patience", type=int, default=5,
+                   help="选择阶段早停耐心（重拟合阶段无早停）")
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--loader-workers", type=int, default=0)
 
@@ -234,12 +575,26 @@ def main():
 
     if min(a.val_days, a.test_days) < a.min_eval_samples:
         raise ValueError(
-            "当前保留单股评估样本下限，"
+            "选择阶段保留单股评估样本下限，"
             "val-days/test-days 不能小于 min-eval-samples"
         )
 
+    if a.refit_window_policy == "keep_train_days" and a.train_days is None:
+        raise ValueError("--refit-window-policy=keep_train-days 需要 --train-days")
+
+    if a.pit_universe and a.universe_csv:
+        raise ValueError("--pit-universe 与 --universe-csv 互斥")
+    if not a.pit_universe and not a.universe_csv:
+        raise ValueError("必须提供 --universe-csv 或使用 --pit-universe")
+    if a.pit_universe and (
+        a.pit_top_mv < 1 or a.pit_min_years <= 0 or a.pit_baidu_fresh_days < 0
+    ):
+        raise ValueError("pit 股票池参数不合法")
+
     db = str(Path(a.db).resolve())
-    universe = str(Path(a.universe_csv).resolve())
+    universe = (
+        str(Path(a.universe_csv).resolve()) if a.universe_csv else None
+    )
     root = Path(a.run_root).resolve()
 
     if root.exists():
@@ -248,7 +603,7 @@ def main():
         )
     if not Path(db).exists():
         raise FileNotFoundError(f"数据库不存在：{db}")
-    if not Path(universe).exists():
+    if universe is not None and not Path(universe).exists():
         raise FileNotFoundError(f"股票池文件不存在：{universe}")
 
     con = duckdb.connect(db, read_only=True)
@@ -270,6 +625,8 @@ def main():
             val_days=a.val_days,
             test_days=a.test_days,
             train_days=a.train_days,
+            refit=a.refit,
+            refit_window_policy=a.refit_window_policy,
         )
 
         last_asof = pd.Timestamp(folds[-1]["as_of"])
@@ -282,16 +639,74 @@ def main():
         (root / "oos").mkdir()
 
         plan = {
-            "protocol": "independent_train_val_test_v1",
+            "protocol": (
+                "train_val_refit_v1" if a.refit
+                else "independent_train_val_test_v1"
+            ),
             "training_window": (
                 "rolling" if a.train_days is not None else "expanding"
             ),
+            "refit": None if not a.refit else {
+                "protocol": "train_val_refit_v1",
+                "budget_rule": "same_epochs",
+                "budget_rule_note": (
+                    "验证阶段确定数据遍历次数，最终在更大的 Train+Val 上"
+                    "使用相同遍历次数；相同 epoch 意味着更多优化器更新"
+                    "步数；不能用后面折的结果调整前面折的训练预算"
+                ),
+                "refit_window_policy": a.refit_window_policy,
+                "stages": [
+                    "1 selection: train_val_test 导出（train<=A、"
+                    "val<=B）、独立预处理、从头训练、Val 早停选 "
+                    "best_epoch",
+                    "2 refit: train_test 导出（fit<=B）、Train+Val 重新"
+                    "拟合预处理、从头初始化、固定 best_epoch、无早停",
+                    "3 oos: 重拟合模型预测测试块；选择阶段测试预测保留"
+                    "为协议 A 对照（oos/selection_control/）",
+                ],
+                "warm_start": {
+                    "implemented": False,
+                    "note": (
+                        "跨折 warm-start 不在本协议内；每股 scaler/schema"
+                        "/特征保留列每折重拟合，上一折权重不能当作无条件"
+                        "兼容的连续训练状态；上一折最终模型可能已见过本"
+                        "折验证窗口标签，不能用于本折早停选择"
+                    ),
+                },
+            },
+            "pit_universe": None if not a.pit_universe else {
+                "top_mv": a.pit_top_mv,
+                "min_years": a.pit_min_years,
+                "baidu_fresh_days": a.pit_baidu_fresh_days,
+                "decision_times": (
+                    {"selection": "train_end(A)", "refit": "val_end(B)"}
+                    if a.refit else {"export": "train_end(A)"}
+                ),
+                "pit_criteria": [
+                    "listed_by_as_of", "quote_history_span_days",
+                    "quote_days", "has_rzrq", "has_fresh_baidu",
+                ],
+                "snapshot_criteria": [
+                    "top_mv_rank", "baidu_keyword_name_mapping",
+                    "industry_l2", "stock_list_membership",
+                ],
+                "note": (
+                    "部分 PIT：上市日期/行情/两融/百度按 as-of 时点评估；"
+                    "市值排名与简称映射仍是当前快照"
+                ),
+            },
             "args": vars(a),
             "db": db,
             "db_state": baseline_state,
             "universe_csv": universe,
-            "universe_sha256": ds.sha256_file(universe),
+            "universe_sha256": (
+                ds.sha256_file(universe) if universe else None
+            ),
             "dataset_script_sha256": ds.sha256_file(ds.__file__),
+            "select_universe_script_sha256": (
+                ds.sha256_file(SCRIPT_DIR / "select_universe.py")
+                if a.pit_universe else None
+            ),
             "export_script_sha256": ds.sha256_file(
                 SCRIPT_DIR / "export_global.py"
             ),
@@ -301,13 +716,15 @@ def main():
             "folds": folds,
             "actual_last_test_date": folds[-1]["as_of"],
             "limitations": [
-                "固定输入股票池属于条件性历史评估，不是 point-in-time "
-                "股票池回测",
-                "每折参数截至 train_end，Val 仅用于早停选 checkpoint，"
-                "与部署期滚动重训口径不同",
+                "固定输入股票池属于条件性历史评估；--pit-universe 仅为部分"
+                " PIT（市值排名与简称映射仍是当前快照）",
+                "无重拟合协议参数截至 train_end；重拟合协议用 Train+Val "
+                "缓解，same_epochs 预算下相同 epoch 意味着更多更新步数",
                 "每折实际入模股票可能不同（训练期辅助数据覆盖筛选），"
                 "按折报告，不做事后交集重训",
                 "统计口径收益率评估，不是可实现交易收益",
+                "fit_timing 的时限检查只是离线回测的墙上时钟记录，不能"
+                "证明当时能按时完成",
             ],
         }
         ds.json_write(root / "walk_forward_plan.json", plan)
@@ -320,110 +737,250 @@ def main():
             )
 
         predictions = []
+        control_predictions = []
         fold_metrics = {}
+        fit_timing = []
 
         for fold in folds:
             fold_id = fold["fold_id"]
 
-            # 数据库快照守护：追加行情或日历变化即硬失败。
-            current_state = read_db_state(con, calendar)
-            if current_state != baseline_state:
-                raise ValueError(
-                    "数据库在运行期间发生变化（最新行情日或交易日历指纹"
-                    "不一致）；请使用固定数据库快照，并换新的 run-root 重跑"
+            # 每折股票池：固定输入或按 A 时点生成的部分 PIT 池。
+            if a.pit_universe:
+                fold_data_root = root / "data" / fold_id
+                selection_universe = fold_data_root / "universe_selection.csv"
+                info = run_pit_universe(
+                    a, db, selection_universe, fold["train_end"],
+                    f"{fold_id}/selection",
+                )
+                universes = {"selection": info}
+            else:
+                selection_universe = Path(universe)
+                universes = None
+
+            if not a.refit:
+                # ===== 无重拟合协议 A（原协议，保留作为对照）=====
+                ensure_db_state(
+                    con, calendar, baseline_state, f"{fold_id} export"
                 )
 
-            data_root = root / "data" / fold_id
-            out_dir = root / "checkpoints" / fold_id
+                data_root = root / "data" / fold_id
+                out_dir = root / "checkpoints" / fold_id
 
-            export_command = [
-                sys.executable,
-                str(SCRIPT_DIR / "export_global.py"),
-                "--db", db,
-                "--universe-csv", universe,
-                "--data-root", str(data_root),
-                "--workers", str(a.export_workers),
-                "--seq-len", str(a.seq_len),
-                "--test-days", str(a.test_days),
-                "--val-days", str(a.val_days),
-                "--min-train-samples", str(a.min_train_samples),
-                "--min-eval-samples", str(a.min_eval_samples),
-                "--as-of", fold["as_of"],
-                "--train-end", fold["train_end"],
-                "--val-end", fold["val_end"],
-            ]
-            if fold["train_start"] is not None:
-                export_command += ["--train-start", fold["train_start"]]
+                run_command(export_command(
+                    a, db, selection_universe, data_root, fold,
+                    layout="train_val_test",
+                    train_end=fold["train_end"], val_end=fold["val_end"],
+                ))
+                verify_export_config(data_root, {
+                    "as_of": fold["as_of"],
+                    "train_end": fold["train_end"],
+                    "val_end": fold["val_end"],
+                    "train_start": fold["train_start"],
+                    "split_layout": "train_val_test",
+                }, fold_id)
 
-            run_command(export_command)
+                run_command(train_command(
+                    a, data_root, out_dir, mode="train", epochs=a.epochs
+                ))
 
-            # 折边界登记复核：导出登记必须与调度计划完全一致。
-            exported = json.loads(
-                (data_root / "export_config.json").read_text(
-                    encoding="utf-8"
+                frame = pd.read_csv(
+                    out_dir / "test_predictions.csv", dtype={"symbol": str}
                 )
-            )
-            for key in ("as_of", "train_end", "val_end", "train_start"):
-                if exported.get(key) != fold[key]:
-                    raise ValueError(
-                        f"{fold_id}: 导出登记 {key}={exported.get(key)} "
-                        f"与计划 {fold[key]} 不一致"
+                check_fold_frame(frame, fold, fold_id, "test")
+
+                frame["fold_id"] = fold_id
+                frame["train_start"] = fold["train_start"]
+                frame["train_end"] = fold["train_end"]
+                frame["val_end"] = fold["val_end"]
+                predictions.append(frame)
+
+                fold_metrics[fold_id] = json.loads(
+                    (out_dir / "test_metrics.json").read_text(
+                        encoding="utf-8"
                     )
+                )
+                print(
+                    f"\n[FOLD OK] {fold_id}: rows={len(frame)}, "
+                    f"stocks={frame['symbol'].nunique()}, "
+                    f"test={fold['test_start']}~{fold['as_of']}"
+                )
 
-            train_command = [
-                sys.executable,
-                str(SCRIPT_DIR / "train_global_timexer.py"),
-                "--mode", "train",
-                "--data-root", str(data_root),
-                "--out-dir", str(out_dir),
-                "--epochs", str(a.epochs),
-                "--patience", str(a.patience),
-                "--batch-size", str(a.batch_size),
-                "--workers", str(a.loader_workers),
-                "--d-model", str(a.d_model),
-                "--e-layers", str(a.e_layers),
-                "--n-heads", str(a.n_heads),
-                "--patch-len", str(a.patch_len),
-                "--lr", str(a.lr),
-                "--dropout", str(a.dropout),
-                "--weight-decay", str(a.weight_decay),
-                "--seed", str(a.seed),
-                "--device", a.device,
-            ]
-            run_command(train_command)
+                if a.pit_universe:
+                    ds.json_write(
+                        root / "data" / fold_id / "pit_universes.json",
+                        universes,
+                    )
+                continue
 
-            frame = pd.read_csv(
-                out_dir / "test_predictions.csv",
-                dtype={"symbol": str},
+            # ===== 两阶段协议 B：阶段 1 选择 =====
+            ensure_db_state(
+                con, calendar, baseline_state, f"{fold_id} selection export"
             )
-            target_dates = pd.to_datetime(frame["target_date"])
 
-            inside = (
-                target_dates.ge(pd.Timestamp(fold["test_start"]))
-                & target_dates.le(pd.Timestamp(fold["as_of"]))
-            )
-            if frame.empty or not inside.all():
-                raise ValueError(f"{fold_id}: 测试预测为空或日期越界")
+            selection_data_root = root / "data" / fold_id / "selection"
+            selection_out_dir = root / "checkpoints" / fold_id / "selection"
 
-            if frame.duplicated(["symbol", "target_date"]).any():
-                raise ValueError(f"{fold_id}: 单折预测存在重复")
+            run_command(export_command(
+                a, db, selection_universe, selection_data_root, fold,
+                layout="train_val_test",
+                train_end=fold["train_end"], val_end=fold["val_end"],
+            ))
+            verify_export_config(selection_data_root, {
+                "as_of": fold["as_of"],
+                "train_end": fold["train_end"],
+                "val_end": fold["val_end"],
+                "train_start": fold["train_start"],
+                "split_layout": "train_val_test",
+            }, f"{fold_id}/selection")
 
-            frame["fold_id"] = fold_id
-            frame["train_start"] = fold["train_start"]
-            frame["train_end"] = fold["train_end"]
-            frame["val_end"] = fold["val_end"]
-            predictions.append(frame)
+            run_command(train_command(
+                a, selection_data_root, selection_out_dir,
+                mode="train", epochs=a.epochs,
+            ))
 
-            fold_metrics[fold_id] = json.loads(
-                (out_dir / "test_metrics.json").read_text(
+            # best_epoch 即重拟合阶段的固定训练预算（same_epochs）。
+            selection_result = json.loads(
+                (selection_out_dir / "selection_result.json").read_text(
                     encoding="utf-8"
                 )
             )
+            best_epoch = int(selection_result["best_epoch"])
+            if best_epoch < 1:
+                raise ValueError(f"{fold_id}: 选择阶段 best_epoch 异常")
+
+            # 选择阶段的测试预测 = 协议 A 对照（相同样本外日期）。
+            control = load_fold_predictions(selection_out_dir)
+            check_fold_frame(control, fold, fold_id, "selection")
+
+            control["fold_id"] = fold_id
+            control["train_start"] = fold["train_start"]
+            control["train_end"] = fold["train_end"]
+            control["val_end"] = fold["val_end"]
+            control_predictions.append(control)
+
+            fit_timing.append({
+                "fold_id": fold_id,
+                "stage": "selection",
+                "best_epoch": best_epoch,
+                "budget_rule": selection_result.get("budget_rule"),
+                "data_cutoff_time": selection_result.get(
+                    "fit_data_cutoff_time"
+                ),
+                "fit_started_at": selection_result.get("fit_started_at"),
+                "fit_finished_at": selection_result.get("fit_finished_at"),
+                "first_prediction_time": selection_result.get(
+                    "first_prediction_time"
+                ),
+                "deadline_met": selection_result.get(
+                    "would_meet_first_prediction_deadline"
+                ),
+            })
+
+            # ===== 阶段 2 重拟合 =====
+            ensure_db_state(
+                con, calendar, baseline_state, f"{fold_id} refit export"
+            )
+
+            if a.pit_universe:
+                refit_universe = root / "data" / fold_id / "universe_refit.csv"
+                universes["refit"] = run_pit_universe(
+                    a, db, refit_universe, fold["val_end"],
+                    f"{fold_id}/refit",
+                )
+            else:
+                refit_universe = Path(universe)
+
+            refit_data_root = root / "data" / fold_id / "refit"
+            refit_out_dir = root / "checkpoints" / fold_id / "refit"
+
+            run_command(export_command(
+                a, db, refit_universe, refit_data_root, fold,
+                layout="train_test",
+                train_end=fold["val_end"],
+                train_start_key="refit_train_start",
+            ))
+            verify_export_config(refit_data_root, {
+                "as_of": fold["as_of"],
+                "train_end": fold["val_end"],
+                "val_end": None,
+                "train_start": fold["refit_train_start"],
+                "split_layout": "train_test",
+            }, f"{fold_id}/refit")
+
+            refit_extra = [
+                "--selection-result", str(
+                    selection_out_dir / "selection_result.json"
+                ),
+                "--refit-window-policy", a.refit_window_policy,
+            ]
+            if a.pit_universe:
+                # 股票池资格决定时点：重拟合池按 B 时点重新确定。
+                refit_extra += [
+                    "--universe-decision-time", fold["val_end"],
+                ]
+            run_command(train_command(
+                a, refit_data_root, refit_out_dir,
+                mode="refit", epochs=best_epoch, extra=refit_extra,
+            ))
+
+            treatment = load_fold_predictions(refit_out_dir)
+            check_fold_frame(treatment, fold, fold_id, "refit")
+
+            treatment["fold_id"] = fold_id
+            treatment["refit_train_start"] = fold["refit_train_start"]
+            treatment["fit_end"] = fold["val_end"]
+            predictions.append(treatment)
+
+            fit_metadata = json.loads(
+                (refit_out_dir / "fit_metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            fit_timing.append({
+                "fold_id": fold_id,
+                "stage": "refit",
+                "best_epoch": best_epoch,
+                "budget_rule": fit_metadata["training_budget"]["rule"],
+                "data_cutoff_time": fit_metadata.get("fit_data_cutoff_time"),
+                "fit_started_at": fit_metadata.get("fit_started_at"),
+                "fit_finished_at": fit_metadata.get("fit_finished_at"),
+                "first_prediction_time": fit_metadata.get(
+                    "first_prediction_time"
+                ),
+                "deadline_met": fit_metadata.get(
+                    "would_meet_first_prediction_deadline"
+                ),
+            })
+
+            fold_metrics[fold_id] = {
+                "selection": {
+                    "best_epoch": best_epoch,
+                    "test_metrics": json.loads(
+                        (selection_out_dir / "test_metrics.json").read_text(
+                            encoding="utf-8"
+                        )
+                    ),
+                },
+                "refit": {
+                    "test_metrics": json.loads(
+                        (refit_out_dir / "test_metrics.json").read_text(
+                            encoding="utf-8"
+                        )
+                    ),
+                },
+            }
             print(
-                f"\n[FOLD OK] {fold_id}: rows={len(frame)}, "
-                f"stocks={frame['symbol'].nunique()}, "
+                f"\n[FOLD OK] {fold_id}: best_epoch={best_epoch}, "
+                f"refit rows={len(treatment)}, "
+                f"stocks={treatment['symbol'].nunique()}, "
                 f"test={fold['test_start']}~{fold['as_of']}"
             )
+
+            if a.pit_universe:
+                ds.json_write(
+                    root / "data" / fold_id / "pit_universes.json",
+                    universes,
+                )
 
         oos = pd.concat(predictions, ignore_index=True)
         oos = oos.sort_values(
@@ -438,10 +995,47 @@ def main():
         summary = train_global_timexer.save_test_report(oos, root / "oos")
 
         ds.json_write(root / "fold_metrics.json", fold_metrics)
-        ds.json_write(root / "oos_summary.json", summary)
+
+        if not a.refit:
+            ds.json_write(root / "oos_summary.json", summary)
+            print(
+                f"\n[OK] folds={len(folds)}, oos_rows={len(oos)}, "
+                f"stocks={oos['symbol'].nunique()}, "
+                f"dates={oos['target_date'].nunique()}"
+            )
+            print(f"输出目录：{root}")
+            return
+
+        # 协议 A 对照合集（与协议 B 完全相同的 OOS 日期）。
+        control_oos = pd.concat(control_predictions, ignore_index=True)
+        control_oos = control_oos.sort_values(
+            ["target_date", "symbol"]
+        ).reset_index(drop=True)
+        if control_oos.duplicated(["symbol", "target_date"]).any():
+            raise ValueError("不同 fold 的协议 A 对照预测存在重复")
+
+        control_summary = train_global_timexer.save_test_report(
+            control_oos, root / "oos" / "selection_control"
+        )
+        comparison = protocol_comparison(control_oos, oos)
+
+        ds.json_write(root / "oos" / "comparison.json", comparison)
+        ds.json_write(root / "oos_summary.json", {
+            "protocol": "train_val_refit_v1",
+            "budget_rule": "same_epochs",
+            "refit_window_policy": a.refit_window_policy,
+            "refit": summary,
+            "selection_control": control_summary,
+            "comparison": comparison,
+        })
+        pd.DataFrame(fit_timing).to_csv(
+            root / "fit_timing.csv", index=False
+        )
 
         print(
-            f"\n[OK] folds={len(folds)}, oos_rows={len(oos)}, "
+            f"\n[OK] folds={len(folds)}, "
+            f"refit oos_rows={len(oos)}, "
+            f"control rows={len(control_oos)}, "
             f"stocks={oos['symbol'].nunique()}, "
             f"dates={oos['target_date'].nunique()}"
         )

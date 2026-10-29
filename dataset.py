@@ -13,6 +13,11 @@ holiday_calendar 推导（is_holiday_related 即休市标记），无需外部 C
     5. 连续矩阵 + 样本索引，避免展开全部历史窗口
     6. 独立 infer 模式，冻结特征和预处理参数
     7. 附带 PyTorch Dataset，训练时直接读取导出结果
+    8. 两种样本划分布局（--split-layout，见 SPLIT_LAYOUTS）：
+       train_val_test（默认，原协议：train/val/test 三分）；
+       train_test（walk-forward 两阶段协议的重拟合导出：Train+Val 合并
+       为训练集、无验证集，--train-end 即最终训练截止日 fit_end；
+       测试覆盖率只登记不强制，不决定训练资格）
 
 预测时点：
     历史行情截至交易日 t。
@@ -149,12 +154,20 @@ except Exception:  # torch 仅训练读取需要，预处理可不安装
     HAS_TORCH = False
 
 
-VERSION = "stock_timexer_v5"
-# 可读取的历史版本：旧版缺少日历指纹、sample_selection 等新增字段，
-# infer 按兼容逻辑回退旧行为并提示。
+VERSION = "stock_timexer_v6"
+# 可读取的历史版本：旧版缺少日历指纹、sample_selection、split_layout 等
+# 新增字段，infer 按兼容逻辑回退旧行为并提示。
 COMPATIBLE_VERSIONS = (
     "stock_timexer_v3", "stock_timexer_v4", "stock_timexer_v5",
+    "stock_timexer_v6",
 )
+
+# 样本划分布局：
+#   train_val_test：train <= train_end < val <= val_end < test（原协议）；
+#   train_test：   train <= train_end（即 fit_end，含验证区间）< test。
+# train_test 用于 walk-forward 两阶段协议的重拟合导出：验证集在测试开始前
+# 已成为历史，可以进入最终训练；测试集不参与任何训练期决策。
+SPLIT_LAYOUTS = ("train_val_test", "train_test")
 TARGET = "stock_return"
 
 DEFAULT_DB = "../AutoTS/download/autots.duckdb"
@@ -790,8 +803,14 @@ def build_features(prices, calendar, as_of, specs, config):
 
 
 def make_samples(features, core_valid, config, train_end, val_end,
-                 start=None, tail=None):
+                 start=None, tail=None, split_layout="train_val_test"):
     """返回 (样本表, 候选目标日数, 剔除统计)。
+
+    split_layout 见模块常量 SPLIT_LAYOUTS：
+      train_val_test：target <= train_end 为 train，<= val_end 为 val，
+        其余为 test；
+      train_test：target <= train_end（此时 train_end 即重拟合截止日
+        fit_end，包含原验证区间）为 train，其余为 test，不产生 val 样本。
 
     剔除统计区分三类（对应"可预测 / 可标注"口径）：
       insufficient_history：历史不足，尚不能开窗（结构性预热）；
@@ -800,6 +819,10 @@ def make_samples(features, core_valid, config, train_end, val_end,
       invalid_target_label：输入窗口有效、预测本可发出，但目标日无有效
         行情或标签（事后筛选，存在样本选择偏差，数量应被报告）。
     """
+    if split_layout not in SPLIT_LAYOUTS:
+        raise ValueError(f"不支持的 split_layout：{split_layout}")
+    if split_layout == "train_test" and val_end is not None:
+        raise ValueError("train_test 布局没有验证集，val_end 必须为 None")
     length = config["seq_len"]
     index = features.index
     y = features[TARGET].to_numpy(dtype=float)
@@ -836,11 +859,14 @@ def make_samples(features, core_valid, config, train_end, val_end,
             exclusions["invalid_target_label"] += 1
             continue
 
-        split = (
-            "train" if target_date <= train_end
-            else "val" if target_date <= val_end
-            else "test"
-        )
+        if split_layout == "train_test":
+            split = "train" if target_date <= train_end else "test"
+        else:
+            split = (
+                "train" if target_date <= train_end
+                else "val" if target_date <= val_end
+                else "test"
+            )
         records.append({
             "start_pos": first,
             "end_pos": end,
@@ -986,11 +1012,19 @@ def load_asof(args, con, calendar):
 
 def coverage_report(features, valid_price, samples, train_end, val_end):
     index = features.index
-    masks = {
-        "train": index <= train_end,
-        "val": (index > train_end) & (index <= val_end),
-        "test": index > val_end,
-    }
+    # train_test 布局没有验证区间：train <= train_end（即 fit_end），
+    # test 直接从 train_end 之后开始。
+    if val_end is None:
+        masks = {
+            "train": index <= train_end,
+            "test": index > train_end,
+        }
+    else:
+        masks = {
+            "train": index <= train_end,
+            "val": (index > train_end) & (index <= val_end),
+            "test": index > val_end,
+        }
     report = {}
     for name, mask in masks.items():
         if not mask.any():
@@ -1138,20 +1172,37 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
     )
 
     if frozen is None:
+        split_layout = getattr(args, "split_layout", None) or "train_val_test"
+        if split_layout not in SPLIT_LAYOUTS:
+            raise ValueError(f"不支持的 split_layout：{split_layout}")
+
         train_end = pd.Timestamp(args.train_end).normalize()
-        val_end = pd.Timestamp(args.val_end).normalize()
+        if split_layout == "train_val_test":
+            if args.val_end is None:
+                raise ValueError("train_val_test 布局必须提供 val_end")
+            val_end = pd.Timestamp(args.val_end).normalize()
+        else:
+            if args.val_end is not None:
+                raise ValueError(
+                    "train_test 布局没有验证集，不能提供 val_end"
+                )
+            val_end = None
         start = pd.Timestamp(args.start).normalize() if args.start else None
 
         samples, candidates, exclusions = make_samples(
             features, core_valid, config, train_end, val_end,
-            start=start, tail=args.tail,
+            start=start, tail=args.tail, split_layout=split_layout,
         )
         counts = samples["split"].value_counts()
-        minimums = {
-            "train": args.min_train_samples,
-            "val": args.min_eval_samples,
-            "test": args.min_eval_samples,
-        }
+        # 能否拟合模型（train 下限）与能否完成该段评估（val/test 下限）
+        # 分开：train_test 布局只强制训练下限，测试覆盖率作为评估信息
+        # 登记，不决定训练资格。
+        minimums = {"train": args.min_train_samples}
+        if split_layout == "train_val_test":
+            minimums.update({
+                "val": args.min_eval_samples,
+                "test": args.min_eval_samples,
+            })
         for split, minimum in minimums.items():
             if int(counts.get(split, 0)) < minimum:
                 raise ValueError(
@@ -1166,6 +1217,7 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
             "version": VERSION,
             "symbol": symbol,
             "config": config,
+            "split_layout": split_layout,
             "train_end": args.train_end,
             "val_end": args.val_end,
             # 样本选择口径登记：--start 限制最早目标日期（walk-forward
@@ -1188,6 +1240,15 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
         report = coverage_report(
             features, valid_price, samples, train_end, val_end
         )
+        if split_layout == "train_test":
+            # train_test：测试覆盖率只登记、不强制（不决定训练资格）。
+            report["test_sample_minimum"] = {
+                "required": args.min_eval_samples,
+                "actual": int(counts.get("test", 0)),
+                "enforced": False,
+                "note": "测试覆盖率为评估信息；不足下限时股票仍可训练，"
+                        "评估期按实际有效样本参与",
+            }
         report["candidate_target_dates"] = candidates
         report["valid_samples"] = len(samples)
         report["valid_sample_ratio"] = (
@@ -1295,10 +1356,15 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
                 columns=preprocessing["feature_columns"],
             )
             preview["y_raw"] = features[TARGET].to_numpy(dtype=float)
-            preview["split"] = np.select(
-                [features.index <= train_end, features.index <= val_end],
-                ["train", "val"], default="test",
-            )
+            if split_layout == "train_test":
+                preview["split"] = np.where(
+                    features.index <= train_end, "train", "test"
+                )
+            else:
+                preview["split"] = np.select(
+                    [features.index <= train_end, features.index <= val_end],
+                    ["train", "val"], default="test",
+                )
             preview.to_csv(temp / "train_preview.csv", index_label="date")
 
         latest = save_latest(
@@ -1421,6 +1487,13 @@ def parse_args():
 
     p.add_argument("--train-end")
     p.add_argument("--val-end")
+    p.add_argument(
+        "--split-layout", choices=list(SPLIT_LAYOUTS),
+        default="train_val_test",
+        help="样本划分布局：train_val_test（原协议，需 --val-end）；"
+             "train_test（walk-forward 重拟合导出，无验证集，"
+             "--train-end 即最终训练截止日 fit_end，不得提供 --val-end）",
+    )
     p.add_argument("--seq-len", type=int, default=60)
     p.add_argument("--return-type", choices=["simple", "log"], default="simple")
     p.add_argument("--min-train-samples", type=int, default=250)
@@ -1557,7 +1630,13 @@ def validate_dataset(data_dir):
     record("target_last_column", columns[-1] == TARGET)
 
     train_end = pd.Timestamp(prep["train_end"])
-    val_end = pd.Timestamp(prep["val_end"])
+    split_layout = prep.get("split_layout", "train_val_test")
+    val_end = (
+        pd.Timestamp(prep["val_end"])
+        if prep.get("val_end") is not None else None
+    )
+    if split_layout == "train_test" and val_end is not None:
+        raise ValueError("train_test 布局的 preprocessing 不应包含 val_end")
 
     if samples is not None:
         sp = samples["start_pos"].to_numpy(dtype=int)
@@ -1610,12 +1689,19 @@ def validate_dataset(data_dir):
 
         tdate = pd.to_datetime(samples["target_date"])
         split = samples["split"]
-        ok = (
-            (tdate[split == "train"] <= train_end).all()
-            and (tdate[split == "val"] > train_end).all()
-            and (tdate[split == "val"] <= val_end).all()
-            and (tdate[split == "test"] > val_end).all()
-        )
+        if split_layout == "train_test":
+            ok = (
+                (tdate[split == "train"] <= train_end).all()
+                and (tdate[split == "test"] > train_end).all()
+                and (split == "val").sum() == 0
+            )
+        else:
+            ok = (
+                (tdate[split == "train"] <= train_end).all()
+                and (tdate[split == "val"] > train_end).all()
+                and (tdate[split == "val"] <= val_end).all()
+                and (tdate[split == "test"] > val_end).all()
+            )
         record("split_boundaries", bool(ok))
 
         # rolling 导出（--start）时训练目标日不得早于登记的训练起点。
@@ -1790,10 +1876,19 @@ def main():
         args.symbol = frozen["symbol"]
         config = frozen["config"]
     else:
-        if not args.train_end or not args.val_end:
-            raise ValueError("prepare 必须提供 train-end 和 val-end")
-        if pd.Timestamp(args.train_end) >= pd.Timestamp(args.val_end):
-            raise ValueError("必须满足 train-end < val-end")
+        if not args.train_end:
+            raise ValueError("prepare 必须提供 train-end")
+        if args.split_layout == "train_val_test":
+            if not args.val_end:
+                raise ValueError(
+                    "train_val_test 布局必须提供 train-end 和 val-end"
+                )
+            if pd.Timestamp(args.train_end) >= pd.Timestamp(args.val_end):
+                raise ValueError("必须满足 train-end < val-end")
+        elif args.val_end:
+            raise ValueError(
+                "train_test 布局没有验证集，不能提供 val-end"
+            )
 
         config = {
             "seq_len": args.seq_len,
@@ -1878,8 +1973,18 @@ def main():
                 args.min_market_symbols,
             )
         as_of = load_asof(args, con, calendar)
-        if args.mode == "prepare" and pd.Timestamp(args.val_end) >= as_of:
+        if (
+            args.mode == "prepare"
+            and args.split_layout == "train_val_test"
+            and pd.Timestamp(args.val_end) >= as_of
+        ):
             raise ValueError("必须满足 val-end < as-of，以保留测试区间")
+        if (
+            args.mode == "prepare"
+            and args.split_layout == "train_test"
+            and pd.Timestamp(args.train_end) > as_of
+        ):
+            raise ValueError("必须满足 train-end <= as-of")
 
         stocks = select_stocks(
             con, args.symbol, args.industry, args.top
