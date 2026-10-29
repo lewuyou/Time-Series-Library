@@ -225,10 +225,11 @@ def robust_stats(values):
 
 
 def make_symbol(rng, symbol, dates, seq_len, train_end_idx, val_end_idx,
-                noise_std, keyword):
+                noise_std, keyword, task="all", engineered=False):
     n_days = len(dates)
     raw = build_raw_features(rng, n_days)
-    signal = dgp_signal(raw, DGP_COEFFS)
+    signal = dgp_signal(raw, DGP_COEFFS, task)
+    base_spec = list(BASE_SPEC) + (ENGINEERED_BASES if engineered else [])
 
     # y[t]（t 日目标值）= 截至 t-1 的信号 + 当日标签噪声；
     # 前 WARMUP 日因滚动窗口未满不可计算，填 0 并在样本表置 label_valid=False。
@@ -237,14 +238,16 @@ def make_symbol(rng, symbol, dates, seq_len, train_end_idx, val_end_idx,
     y[WARMUP:] = signal[WARMUP - 1:-1] + noise[WARMUP:]
 
     # ---- 组装原始矩阵（值列 + 常量标记列），再做训练期标准化 ----
-    columns = column_layout()
+    columns = column_layout(base_spec)
     fit_rows = slice(0, train_end_idx + 1)  # 标准化只用训练期
     matrix_raw = {}
-    for base, has_age in BASE_SPEC:
+    for base, has_age in base_spec:
         matrix_raw[base] = raw[base]
         if has_age:
             matrix_raw[base + "__age_days"] = np.full(n_days, 2.0)
         matrix_raw[base + "__missing"] = np.zeros(n_days)
+    if engineered:
+        matrix_raw.update(engineered_values(raw))
     matrix_raw[TARGET] = y
 
     statistics = {}
@@ -297,7 +300,7 @@ def make_symbol(rng, symbol, dates, seq_len, train_end_idx, val_end_idx,
         "statistics": statistics,
         "dropped_groups": {},
         "train_group_coverage": {
-            base: 1.0 for base, _ in BASE_SPEC
+            base: 1.0 for base, _ in base_spec
         },
         "fit_row_count": train_end_idx + 1,
         "fit_first_date": str(dates[0]),
@@ -344,6 +347,14 @@ def main():
         "--noise-ratio", type=float, default=0.15,
         help="标签噪声标准差 / 信号标准差",
     )
+    parser.add_argument(
+        "--task", choices=TASK_CHOICES, default="all",
+        help="任务拆分：只用对应分量生成 y（实验4）",
+    )
+    parser.add_argument(
+        "--engineered", action="store_true",
+        help="额外注入因果构造特征列（实验3：TimeXer+显式特征）",
+    )
     parser.add_argument("--start-date", default="2023-01-02")
     args = parser.parse_args()
 
@@ -363,6 +374,7 @@ def main():
     probe = make_symbol(
         np.random.default_rng(args.seed + 999_001), "PROBE", dates,
         args.seq_len, train_end_idx, val_end_idx, 0.0, "probe",
+        task=args.task, engineered=args.engineered,
     )
     noise_std = args.noise_ratio * probe["signal_std"]
 
@@ -378,6 +390,7 @@ def main():
             np.random.default_rng(args.seed + 1_000_000 + i), symbol, dates,
             args.seq_len, train_end_idx, val_end_idx, noise_std,
             f"合成股票{i + 1:03d}",
+            task=args.task, engineered=args.engineered,
         )
         directory = out / symbol
         directory.mkdir(parents=True)
@@ -424,12 +437,9 @@ def main():
         "decision_hour": 8,
         "decision_minute": 30,
         "dgp": {
-            "formula": (
-                "y_{t+1} = 0.7*tanh(3*mean5(mom)_t*tanh(2.5*rzrq_t)) "
-                "+ 0.4*sin(3*mean10(baidu)_t) "
-                "+ 0.3*(0.5*vol_t+0.3*vol_{t-1}+0.2*vol_{t-2}) "
-                "+ 0.2*tanh(macroA_t) + eps"
-            ),
+            "task": args.task,
+            "engineered": args.engineered,
+            "formula": TASK_FORMULAS[args.task],
             "signal_std": probe["signal_std"],
             "noise_std": noise_std,
             "noise_ratio": args.noise_ratio,
