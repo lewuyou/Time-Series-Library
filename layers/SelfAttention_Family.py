@@ -15,6 +15,10 @@ def _resolve_attention_mask(attn_mask, mask_flag, batch_size, query_len, key_len
     """
     if attn_mask is not None:
         mask = attn_mask.mask if hasattr(attn_mask, 'mask') else attn_mask
+        if not torch.is_tensor(mask):
+            raise TypeError(
+                'attention mask must be a torch.Tensor '
+                '(or an object exposing a bool `.mask` tensor)')
         if mask.dtype != torch.bool:
             raise TypeError('attention mask must be a bool tensor where True means masked')
         return mask.to(device=device)
@@ -29,14 +33,103 @@ def _resolve_attention_mask(attn_mask, mask_flag, batch_size, query_len, key_len
     return None
 
 
-def _apply_attention_mask(scores, mask, check_rows_fully_masked):
-    """Broadcast ``mask`` to ``scores`` and mask the scores in place (True = masked)."""
-    mask = torch.broadcast_to(mask, scores.shape)
-    if check_rows_fully_masked and mask.all(dim=-1).any():
+def _apply_attention_mask(scores, mask, check_rows_fully_masked=True):
+    """Validate ``mask``, broadcast it to ``scores`` and return the masked scores.
+
+    ``scores``: [B, H, L, S]. Supported mask shapes (True = masked):
+      [L, S]       shared by all samples and heads
+      [B, L, S]    per-sample mask (the batch dim may also be 1)
+      [B, H, L, S] full mask; each dim may be a broadcastable 1
+    A key padding mask [B, S] must be converted by the caller to [B, 1, 1, S]:
+    a 2-D mask is *never* interpreted as [B, S], because when B == L it would be
+    indistinguishable from [L, S].
+
+    This function is NOT in-place: callers must use the returned tensor.
+    """
+    if not torch.is_tensor(mask):
+        raise TypeError('attention mask must be a torch.Tensor')
+
+    if mask.dtype != torch.bool:
+        raise TypeError('attention mask must be bool; True means masked')
+
+    B, H, L, S = scores.shape
+
+    if mask.ndim == 2:
+        if tuple(mask.shape) != (L, S):
+            raise ValueError(
+                f'2-D mask must be [L, S] = [{L}, {S}], got {tuple(mask.shape)}; '
+                'convert a key padding mask to [B, 1, 1, S]')
+        mask = mask[None, None, :, :]
+
+    elif mask.ndim == 3:
+        if mask.shape[0] not in (1, B):
+            raise ValueError(
+                f'3-D mask must be [B, L, S] with batch size 1 or {B}, '
+                f'got batch size {mask.shape[0]}')
+        if tuple(mask.shape[1:]) != (L, S):
+            raise ValueError(
+                f'3-D mask must be [B, L, S] = [{B}, {L}, {S}], got {tuple(mask.shape)}')
+        # per-SAMPLE mask: insert the head axis between batch and query axes.
+        # (plain broadcast_to would right-align [B, L, S] as [1, B, L, S] and
+        # silently apply sample masks to heads when B == H)
+        mask = mask[:, None, :, :]
+
+    elif mask.ndim != 4:
+        raise ValueError('attention mask must have 2, 3 or 4 dimensions')
+
+    mask = mask.to(device=scores.device)
+
+    try:
+        mask = torch.broadcast_to(mask, scores.shape)
+    except RuntimeError as exc:
+        raise ValueError(
+            f'mask shape {tuple(mask.shape)} cannot broadcast to '
+            f'scores shape {tuple(scores.shape)}') from exc
+
+    if check_rows_fully_masked and bool(mask.all(dim=-1).any()):
         raise ValueError(
             'at least one query has all of its keys masked; '
             'softmax over a fully masked row is undefined')
-    return scores.masked_fill_(mask, float('-inf'))
+
+    return scores.masked_fill(mask, float('-inf'))
+
+
+def _check_qkv(queries, keys, values):
+    """Validate attention inputs and derive their dimensions.
+
+    queries: [B, L, H, E]; keys: [B, S, H, E]; values: [B, S, H, D].
+    The key length S is taken from ``keys``: it is what defines the score
+    matrix, while values only provide the V vectors.
+
+    Returns (B, L, H, E, S).
+    """
+    if queries.ndim != 4 or keys.ndim != 4 or values.ndim != 4:
+        raise ValueError(
+            'queries, keys and values must be 4-D tensors '
+            '([B, L, H, E] / [B, S, H, E] / [B, S, H, D]); got shapes '
+            f'{tuple(queries.shape)}, {tuple(keys.shape)}, {tuple(values.shape)}')
+
+    B, L, H, E = queries.shape
+    S = keys.size(1)
+
+    if keys.size(0) != B or values.size(0) != B:
+        raise ValueError(
+            'queries, keys and values must share the batch size; got '
+            f'{B}, {keys.size(0)}, {values.size(0)}')
+    if keys.size(2) != H or values.size(2) != H:
+        raise ValueError(
+            'queries, keys and values must share the number of heads; got '
+            f'{H}, {keys.size(2)}, {values.size(2)}')
+    if keys.size(1) != values.size(1):
+        raise ValueError(
+            f'keys and values must share the key length; got {keys.size(1)}, {values.size(1)}')
+    if keys.size(3) != E:
+        raise ValueError(
+            f'queries and keys must share the per-head dimension; got {E}, {keys.size(3)}')
+    if min(B, L, H, E, S, values.size(3)) < 1:
+        raise ValueError('batch, sequence, head and per-head dimensions must be positive')
+
+    return B, L, H, E, S
 
 
 class DSAttention(nn.Module):
@@ -50,24 +143,38 @@ class DSAttention(nn.Module):
         self.dropout = nn.Dropout(attention_dropout)
 
     def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
-        B, L, H, E = queries.shape
-        _, S, _, D = values.shape
+        B, L, H, E, S = _check_qkv(queries, keys, values)
         scale = self.scale if self.scale is not None else 1. / sqrt(E)
 
-        tau = 1.0 if tau is None else tau.unsqueeze(
-            1).unsqueeze(1)  # B x 1 x 1 x 1
-        delta = 0.0 if delta is None else delta.unsqueeze(
-            1).unsqueeze(1)  # B x 1 x 1 x S
+        if tau is not None:
+            # require the unambiguous [B, 1]: a [B] tau would right-align to the
+            # head axis and silently corrupt results when B == H
+            if not torch.is_tensor(tau) or tuple(tau.shape) != (B, 1):
+                got = tuple(tau.shape) if torch.is_tensor(tau) else type(tau).__name__
+                raise ValueError(f'tau must have shape [B, 1] = [{B}, 1], got {got}')
+            tau = tau.unsqueeze(1).unsqueeze(1)  # B x 1 x 1 x 1
+        else:
+            tau = 1.0
+        if delta is not None:
+            if not torch.is_tensor(delta) or tuple(delta.shape) != (B, S):
+                got = tuple(delta.shape) if torch.is_tensor(delta) else type(delta).__name__
+                raise ValueError(f'delta must have shape [B, S] = [{B}, {S}], got {got}')
+            delta = delta.unsqueeze(1).unsqueeze(1)  # B x 1 x 1 x S
+        else:
+            delta = 0.0
 
-        # De-stationary Attention, rescaling pre-softmax score with learned de-stationary factors
-        scores = torch.einsum("blhe,bshe->bhls", queries, keys) * tau + delta
+        # De-stationary Attention, rescaling pre-softmax score with learned de-stationary factors.
+        # Scale BEFORE masking: masking first would turn -inf entries into NaN
+        # for scale == 0 and into +inf for negative scales.
+        scores = (torch.einsum("blhe,bshe->bhls", queries, keys) * tau + delta) * scale
 
         mask = _resolve_attention_mask(attn_mask, self.mask_flag, B, L, S, queries.device)
         if mask is not None:
             # the auto causal mask can never fully mask a row; only check explicit masks
-            _apply_attention_mask(scores, mask, check_rows_fully_masked=attn_mask is not None)
+            scores = _apply_attention_mask(
+                scores, mask, check_rows_fully_masked=attn_mask is not None)
 
-        A = self.dropout(torch.softmax(scale * scores, dim=-1))
+        A = self.dropout(torch.softmax(scores, dim=-1))
         V = torch.einsum("bhls,bshd->blhd", A, values)
 
         if self.output_attention:
@@ -85,18 +192,20 @@ class FullAttention(nn.Module):
         self.dropout = nn.Dropout(attention_dropout)
 
     def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
-        B, L, H, E = queries.shape
-        _, S, _, D = values.shape
+        B, L, H, E, S = _check_qkv(queries, keys, values)
         scale = self.scale if self.scale is not None else 1. / sqrt(E)
 
-        scores = torch.einsum("blhe,bshe->bhls", queries, keys)
+        # Scale BEFORE masking: masking first would turn -inf entries into NaN
+        # for scale == 0 and into +inf for negative scales.
+        scores = torch.einsum("blhe,bshe->bhls", queries, keys) * scale
 
         mask = _resolve_attention_mask(attn_mask, self.mask_flag, B, L, S, queries.device)
         if mask is not None:
             # the auto causal mask can never fully mask a row; only check explicit masks
-            _apply_attention_mask(scores, mask, check_rows_fully_masked=attn_mask is not None)
+            scores = _apply_attention_mask(
+                scores, mask, check_rows_fully_masked=attn_mask is not None)
 
-        A = self.dropout(torch.softmax(scale * scores, dim=-1))
+        A = self.dropout(torch.softmax(scores, dim=-1))
         V = torch.einsum("bhls,bshd->blhd", A, values)
 
         if self.output_attention:
@@ -122,9 +231,10 @@ class ProbAttention(nn.Module):
         # calculate the sampled Q_K
         K_expand = K.unsqueeze(-3).expand(B, H, L_Q, L_K, E)
         # real U = U_part(factor*ln(L_k))*L_q
-        index_sample = torch.randint(L_K, (L_Q, sample_k))
+        # keep all index tensors on the data device
+        index_sample = torch.randint(L_K, (L_Q, sample_k), device=Q.device)
         K_sample = K_expand[:, :, torch.arange(
-            L_Q).unsqueeze(1), index_sample, :]
+            L_Q, device=Q.device).unsqueeze(1), index_sample, :]
         Q_K_sample = torch.matmul(
             Q.unsqueeze(-2), K_sample.transpose(-2, -1)).squeeze(-2)
 
@@ -133,8 +243,8 @@ class ProbAttention(nn.Module):
         M_top = M.topk(n_top, sorted=False)[1]
 
         # use the reduced Q to calculate Q_K
-        Q_reduce = Q[torch.arange(B)[:, None, None],
-                   torch.arange(H)[None, :, None],
+        Q_reduce = Q[torch.arange(B, device=Q.device)[:, None, None],
+                   torch.arange(H, device=Q.device)[None, :, None],
                    M_top, :]  # factor*ln(L_q)
         Q_K = torch.matmul(Q_reduce, K.transpose(-2, -1))  # factor*ln(L_q)*L_k
 
@@ -162,19 +272,33 @@ class ProbAttention(nn.Module):
 
         attn = self.dropout(torch.softmax(scores, dim=-1))  # nn.Softmax(dim=-1)(scores)
 
-        context_in[torch.arange(B)[:, None, None],
-        torch.arange(H)[None, :, None],
+        context_in[torch.arange(B, device=context_in.device)[:, None, None],
+        torch.arange(H, device=context_in.device)[None, :, None],
         index, :] = torch.matmul(attn, V).type_as(context_in)
         if self.output_attention:
-            attns = (torch.ones([B, H, L_V, L_V]) /
-                     L_V).type_as(attn).to(attn.device)
-            attns[torch.arange(B)[:, None, None], torch.arange(H)[
-                                                  None, :, None], index, :] = attn
+            # Non-top queries are approximated by a uniform attention over all
+            # keys; the placeholder map carries the full [B, H, L_Q, L_V] shape
+            # (which also covers cross-attention where L_Q != L_V). It is an
+            # approximation, not an exact explanation of the returned context.
+            attns = attn.new_full((B, H, L_Q, L_V), 1.0 / L_V)
+            attns[torch.arange(B, device=attn.device)[:, None, None],
+            torch.arange(H, device=attn.device)[None, :, None],
+            index, :] = attn
             return context_in, attns
         else:
             return context_in, None
 
     def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
+        if attn_mask is not None:
+            # ProbAttention's sampling cannot honor arbitrary masks: both the
+            # top-query path (masked_fill_ in _update_context) and the initial
+            # context of the remaining queries (V.mean / cumsum) would have to
+            # exclude masked keys. Reject explicitly instead of silently
+            # ignoring (mask_flag=False) or overriding (mask_flag=True) the mask.
+            raise NotImplementedError(
+                'ProbAttention does not support explicit attention masks; '
+                'use FullAttention instead')
+
         B, L_Q, H, D = queries.shape
         _, L_K, _, _ = keys.shape
 
@@ -214,8 +338,16 @@ class AttentionLayer(nn.Module):
                  d_values=None):
         super(AttentionLayer, self).__init__()
 
-        d_keys = d_keys or (d_model // n_heads)
-        d_values = d_values or (d_model // n_heads)
+        if d_model < 1 or n_heads < 1:
+            raise ValueError('d_model and n_heads must be positive')
+        # explicit None checks: `d_keys or ...` would silently treat a
+        # deliberate d_keys=0 as "not provided"
+        if d_keys is None:
+            d_keys = d_model // n_heads
+        if d_values is None:
+            d_values = d_model // n_heads
+        if d_keys < 1 or d_values < 1:
+            raise ValueError('per-head dimensions must be positive')
 
         self.inner_attention = attention
         self.query_projection = nn.Linear(d_model, d_keys * n_heads)
@@ -225,9 +357,22 @@ class AttentionLayer(nn.Module):
         self.n_heads = n_heads
 
     def forward(self, queries, keys, values, attn_mask, tau=None, delta=None):
+        if queries.ndim != 3 or keys.ndim != 3 or values.ndim != 3:
+            raise ValueError(
+                'queries, keys and values must be 3-D tensors '
+                '([B, L, D] / [B, S, D] / [B, S, D]); got shapes '
+                f'{tuple(queries.shape)}, {tuple(keys.shape)}, {tuple(values.shape)}')
         B, L, _ = queries.shape
         _, S, _ = keys.shape
         H = self.n_heads
+        if keys.size(0) != B or values.size(0) != B:
+            raise ValueError(
+                'queries, keys and values must share the batch size; got '
+                f'{B}, {keys.size(0)}, {values.size(0)}')
+        if tuple(keys.shape[:2]) != tuple(values.shape[:2]):
+            raise ValueError(
+                'keys and values must share the batch and key dimensions; got '
+                f'{tuple(keys.shape[:2])}, {tuple(values.shape[:2])}')
 
         queries = self.query_projection(queries).view(B, L, H, -1)
         keys = self.key_projection(keys).view(B, S, H, -1)
@@ -278,6 +423,11 @@ class ReformerLayer(nn.Module):
             return torch.cat([queries, queries.new_zeros(B, fill_len, C)], dim=1)
 
     def forward(self, queries, keys, values, attn_mask, tau, delta):
+        if attn_mask is not None:
+            # LSHSelfAttention has no mask interface, and zero-padding does NOT
+            # make padded tokens stop attending; refuse instead of ignoring
+            raise NotImplementedError(
+                'ReformerLayer does not support attention masks; pass attn_mask=None')
         # in Reformer: defalut queries=keys
         B, N, C = queries.shape
         queries = self.attn(self.fit_length(queries))[:, :N, :]
@@ -317,6 +467,11 @@ class TwoStageAttentionLayer(nn.Module):
                                   nn.Linear(d_ff, d_model))
 
     def forward(self, x, attn_mask=None, tau=None, delta=None):
+        if attn_mask is not None:
+            # the mask is not plumbed through the two-stage attention; refuse
+            # instead of silently ignoring it
+            raise NotImplementedError(
+                'TwoStageAttentionLayer does not support attention masks; pass attn_mask=None')
         # Cross Time Stage: Directly apply MSA to each dimension
         batch = x.shape[0]
         time_in = rearrange(x, 'b ts_d seg_num d_model -> (b ts_d) seg_num d_model')

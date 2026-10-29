@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 import math
+import operator
 
 
 class PositionalEmbedding(nn.Module):
@@ -77,8 +78,28 @@ class FixedEmbedding(nn.Module):
 
 
 class TemporalEmbedding(nn.Module):
+    """Categorical embedding of integer time-stamp features (embed != 'timeF').
+
+    The columns read from ``x_mark`` are fixed by ``freq``:
+      d, b: [month, day, weekday]                          (3 fields)
+      h, s: [month, day, weekday, hour]                    (4 fields)
+      t:    [month, day, weekday, hour, minute]            (5 fields)
+    Expected value ranges: month 1-12, day 1-31, weekday 0-6, hour 0-23 and
+    minute 0-3 (``minute_size=4`` buckets of 15 minutes, NOT raw 0-59 minutes).
+    Continuous time features must be fed to ``TimeFeatureEmbedding`` instead.
+    """
+
+    _FIELDS_PER_FREQ = {'d': 3, 'b': 3, 'h': 4, 's': 4, 't': 5}
+
     def __init__(self, d_model, embed_type='fixed', freq='h'):
         super(TemporalEmbedding, self).__init__()
+
+        if freq not in self._FIELDS_PER_FREQ:
+            raise ValueError(
+                f'TemporalEmbedding does not support freq={freq!r}; '
+                f"supported freqs are {sorted(self._FIELDS_PER_FREQ)} "
+                '(continuous time features need embed_type="timeF")')
+        self.freq = freq
 
         minute_size = 4
         hour_size = 24
@@ -89,21 +110,35 @@ class TemporalEmbedding(nn.Module):
         Embed = FixedEmbedding if embed_type == 'fixed' else nn.Embedding
         if freq == 't':
             self.minute_embed = Embed(minute_size, d_model)
+        # hour_embed is created for every freq so old checkpoints keep the
+        # same key set (it is simply not read for daily/business-day freqs,
+        # whose marks have no hour column)
         self.hour_embed = Embed(hour_size, d_model)
         self.weekday_embed = Embed(weekday_size, d_model)
         self.day_embed = Embed(day_size, d_model)
         self.month_embed = Embed(month_size, d_model)
 
     def forward(self, x):
-        x = x.long()
-        minute_x = self.minute_embed(x[:, :, 4]) if hasattr(
-            self, 'minute_embed') else 0.
-        hour_x = self.hour_embed(x[:, :, 3])
-        weekday_x = self.weekday_embed(x[:, :, 2])
-        day_x = self.day_embed(x[:, :, 1])
-        month_x = self.month_embed(x[:, :, 0])
+        if x.ndim != 3:
+            raise ValueError(
+                f'x_mark must have shape [B, L, K], got {tuple(x.shape)}')
+        required = self._FIELDS_PER_FREQ[self.freq]
+        if x.size(-1) < required:
+            raise ValueError(
+                f"freq={self.freq!r} requires at least {required} integer time "
+                f'fields (month/day/weekday[/hour][/minute]), got {x.size(-1)} '
+                'columns; continuous time features must use '
+                'TimeFeatureEmbedding (embed_type="timeF")')
 
-        return hour_x + weekday_x + day_x + month_x + minute_x
+        x = x.long()
+        result = (self.month_embed(x[:, :, 0])
+                  + self.day_embed(x[:, :, 1])
+                  + self.weekday_embed(x[:, :, 2]))
+        if self.freq in ('h', 's', 't'):
+            result = result + self.hour_embed(x[:, :, 3])
+        if self.freq == 't':
+            result = result + self.minute_embed(x[:, :, 4])
+        return result
 
 
 class TimeFeatureEmbedding(nn.Module):
@@ -131,11 +166,14 @@ class DataEmbedding(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x, x_mark):
+        # project first, then add the position embedding: under AMP autocast the
+        # Linear may return fp16, and the position encoding should match the
+        # projected dtype rather than the raw input dtype
+        x = self.value_embedding(x)
         if x_mark is None:
-            x = self.value_embedding(x) + self.position_embedding(x)
+            x = x + self.position_embedding(x)
         else:
-            x = self.value_embedding(
-                x) + self.temporal_embedding(x_mark) + self.position_embedding(x)
+            x = x + self.temporal_embedding(x_mark) + self.position_embedding(x)
         return self.dropout(x)
 
 
@@ -145,7 +183,11 @@ class DataEmbedding_inverted(nn.Module):
         # `seq_len` (the lookback window length) is the input dimension of the value
         # embedding: each variate's whole series is projected onto one token.
         # `embed_type` / `freq` are kept for interface compatibility but unused here.
-        self.seq_len = int(seq_len)
+        # operator.index() rejects non-integers (e.g. 60.9) with a TypeError
+        # instead of silently truncating them like int() would
+        self.seq_len = operator.index(seq_len)
+        if self.seq_len < 1:
+            raise ValueError('seq_len must be a positive integer')
         self.value_embedding = nn.Linear(self.seq_len, d_model)
         self.dropout = nn.Dropout(p=dropout)
 
@@ -211,6 +253,8 @@ class PatchEmbedding(nn.Module):
         x = self.padding_patch_layer(x)
         x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
         x = torch.reshape(x, (x.shape[0] * x.shape[1], x.shape[2], x.shape[3]))
-        # Input encoding
-        x = self.value_embedding(x) + self.position_embedding(x)
+        # Input encoding: project first so the position embedding matches the
+        # projected dtype (see DataEmbedding.forward)
+        x = self.value_embedding(x)
+        x = x + self.position_embedding(x)
         return self.dropout(x), n_vars
