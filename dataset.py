@@ -149,9 +149,12 @@ except Exception:  # torch 仅训练读取需要，预处理可不安装
     HAS_TORCH = False
 
 
-VERSION = "stock_timexer_v4"
-# 可读取的历史版本：v3 缺少日历指纹等新增字段，infer 会回退旧行为并提示。
-COMPATIBLE_VERSIONS = ("stock_timexer_v3", "stock_timexer_v4")
+VERSION = "stock_timexer_v5"
+# 可读取的历史版本：旧版缺少日历指纹、sample_selection 等新增字段，
+# infer 按兼容逻辑回退旧行为并提示。
+COMPATIBLE_VERSIONS = (
+    "stock_timexer_v3", "stock_timexer_v4", "stock_timexer_v5",
+)
 TARGET = "stock_return"
 
 DEFAULT_DB = "../AutoTS/download/autots.duckdb"
@@ -1165,6 +1168,14 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
             "config": config,
             "train_end": args.train_end,
             "val_end": args.val_end,
+            # 样本选择口径登记：--start 限制最早目标日期（walk-forward
+            # rolling 每折不同），--tail 限制最近候选目标日；两者都改变
+            # 样本集合，导出复用与训练装载时都会比对，防止不同训练起点
+            # 的导出被误复用。
+            "sample_selection": {
+                "start": str(start.date()) if start is not None else None,
+                "tail": args.tail,
+            },
             # validate 模式重拟合对比需要与训练一致的过滤阈值。
             "min_feature_coverage": args.min_feature_coverage,
             "min_observations": args.min_observations,
@@ -1607,6 +1618,17 @@ def validate_dataset(data_dir):
         )
         record("split_boundaries", bool(ok))
 
+        # rolling 导出（--start）时训练目标日不得早于登记的训练起点。
+        start_value = (prep.get("sample_selection") or {}).get("start")
+        if start_value is not None:
+            record(
+                "train_start_lower_bound",
+                bool(
+                    (tdate[split == "train"] >= pd.Timestamp(start_value)).all()
+                ),
+                f"start={start_value}",
+            )
+
         # 训练前数据预览 CSV 与矩阵逐值一致（导出即训练输入的复核）。
         # CSV 十进制往返存在浮点表示噪声（float32 最短表示 ~1e-6 相对
         # 误差），用相对容差比较；真实数据错误远大于该量级。
@@ -1760,7 +1782,8 @@ def main():
         if frozen["version"] != VERSION:
             print(
                 f"[WARN] 预处理文件为 {frozen['version']}（当前 {VERSION}），"
-                "缺少日历指纹等新增字段：日历参数回退命令行，且不校验历史前缀"
+                "按兼容逻辑读取；旧文件可能缺少日历指纹、sample_selection "
+                "等新增元信息，相关校验会回退"
             )
         if args.symbol and norm_symbol(args.symbol) != frozen["symbol"]:
             raise ValueError("指定股票与预处理文件不一致")

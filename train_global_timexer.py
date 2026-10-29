@@ -24,6 +24,13 @@
             --checkpoint checkpoints/global_timexer_001/checkpoint.pth \
             --data-dir dataset/global_infer_001/601398 --device auto
 
+    第 5 步 walk-forward 滚动评估（可选，见 walk_forward.py）：
+        python walk_forward.py --db ... --universe-csv ... \
+            --run-root runs/wf_001 --first-test-date 2024-01-02 \
+            --last-test-date 2024-12-31 --val-days 60 --test-days 20
+        每折独立导出（显式日期边界）、独立拟合预处理、从头训练，
+        测试块互不重叠，最后拼接样本外预测统一评估。
+
 训练输出（--out-dir）：
     checkpoint.pth                早停保存的最优共享模型（含每股预处理登记）
     history.json                  逐轮 train/val 股票等权标准化 MSE
@@ -140,6 +147,12 @@ def load_catalog(data_root):
     for key in ("train_end", "val_end", "seq_len"):
         if key not in spec:
             raise ValueError(f"export_config.json 缺少字段 {key}")
+    # walk-forward / rolling 防错配：单股导出的样本起点必须与导出任务
+    # 登记一致，避免相同截止日、不同训练起点的导出混入同一训练。
+    expected_selection = {
+        "start": spec.get("train_start"),
+        "tail": None,
+    }
 
     symbols = sorted(
         report.loc[report.status == "ok", "symbol"].unique().tolist()
@@ -167,6 +180,10 @@ def load_catalog(data_root):
             raise ValueError(f"{symbol}: val_end 与导出任务登记不一致")
         if prep["config"]["seq_len"] != spec["seq_len"]:
             raise ValueError(f"{symbol}: seq_len 与导出任务登记不一致")
+        if prep.get("sample_selection") != expected_selection:
+            raise ValueError(
+                f"{symbol}: 样本起点配置与 export_config.json 不一致"
+            )
 
         # baidu_keyword 本来就应该随股票不同，不纳入一致性比较。
         config = {
@@ -273,6 +290,14 @@ class PanelWindows(Dataset):
 
             if split == "train":
                 valid = target_dates <= train_end
+                # rolling 导出（--train-start）时训练目标日不得早于
+                # 登记的训练起点；make_samples 已限制，这里是装载期
+                # 的纵深防御。
+                start_value = (
+                    r["prep"].get("sample_selection") or {}
+                ).get("start")
+                if start_value:
+                    valid &= target_dates >= np.datetime64(start_value, "D")
             elif split == "val":
                 valid = (
                     (target_dates > train_end) & (target_dates <= val_end)
@@ -606,6 +631,12 @@ def train(args, device):
         "format": "global_timexer_typed_v1",
         "model_config": config,
         "schema": schema,
+        # 登记导出任务配置：本折数据截止日、训练起点、训练/验证边界、
+        # 脚本与数据哈希，checkpoint 可直接追溯到生成它的数据口径
+        # （walk-forward 每折不同）。
+        "export_config": read_json(
+            Path(args.data_root) / "export_config.json"
+        ),
         "preprocessing": {
             r["symbol"]: r["prep"] for r in records
         },

@@ -40,16 +40,34 @@
 设计要点：
     - 每只股票独立导出、统一日期边界；特征并集 + 缺失标记由
       train_global_timexer.py 统一处理，本脚本只负责单股导出与复检。
-    - 切分口径：最后 test_days（默认 30）个交易日为目标日的 test 集；
-      val_end = 倒数第 test_days+1 个交易日，train_end = 再往前 val_days
-      个交易日，保证 train/val 的输入窗口与标签完全不触碰最后 30 天数据。
+    - 切分口径（两种模式）：
+      1) 自动倒推（默认，与单次评估一致）：最后 test_days（默认 30）个
+         交易日为目标日的 test 集；val_end = 倒数第 test_days+1 个交易日，
+         train_end = 再往前 val_days 个交易日，保证 train/val 的输入窗口
+         与标签完全不触碰最后 30 天数据；
+      2) 显式边界（walk-forward 每折）：--as-of、--train-end、--val-end
+         必须同时提供，均为交易日历内日期且满足 train-end < val-end <
+         as-of <= 库内最新行情日；此时 --test-days/--val-days 只用于
+         登记与样本量下限校验，实际边界以显式日期为准。可选
+         --train-start 限制最早训练目标日期（rolling 训练窗口），
+         不提供时使用全部可用历史（expanding）。
     - dataset.py 会按训练期覆盖率过滤特征列；本脚本导出后检查
       feature_columns 仍保留 baidu_* 与 rzrq_*，缺失者标记为
       filtered_no_baidu / filtered_no_rzrq，不进入共享训练。
-    - 断点续跑：data-root/export_config.json 登记导出配置；配置一致的
-      重复运行复用已有股票目录，配置变化必须换新的 data-root。
+    - 断点续跑：data-root/export_config.json 登记导出配置（含
+      train_start）；配置一致的重复运行复用已有股票目录（含
+      sample_selection 比对，避免相同截止日、不同训练起点的目录被
+      误复用），配置变化必须换新的 data-root。
     - 建议固定项目 git commit，避免官方 TimeXer.py / embedding 实现变化
       后与 checkpoint 结构不兼容。
+
+walk-forward 滚动评估（第 5 步，可选）：
+    python walk_forward.py --db ... --universe-csv ... --run-root runs/wf_001 \
+        --first-test-date 2024-01-02 --last-test-date 2024-12-31 \
+        --val-days 60 --test-days 20 ...
+    调度器按交易日历生成互不重叠的测试折，每折用显式边界调用本脚本
+    独立导出（独立拟合预处理），再调用 train_global_timexer.py 从头
+    训练，最后拼接所有折的样本外预测。
 
 注意：
     select_universe.py 的粗筛（行情天数等）不保证百度/两融各自覆盖
@@ -84,11 +102,48 @@ def parse_args():
     p.add_argument("--val-days", type=int, default=60)
     p.add_argument("--min-train-samples", type=int, default=250)
     p.add_argument("--min-eval-samples", type=int, default=20)
+    p.add_argument(
+        "--as-of",
+        help="显式切分：本折数据截止日（测试结束日）；与 --train-end、"
+             "--val-end 一起提供，用于 walk-forward 历史折",
+    )
+    p.add_argument(
+        "--train-end",
+        help="显式切分：训练目标日上限（交易日历内日期）",
+    )
+    p.add_argument(
+        "--val-end",
+        help="显式切分：验证目标日上限（交易日历内日期）",
+    )
+    p.add_argument(
+        "--train-start",
+        help="最早训练目标日期（rolling 训练窗口下限）；不提供时使用"
+             "全部可用历史（expanding）",
+    )
     return p.parse_args()
 
 
-def resolve_split(db, test_days, val_days):
-    """返回 (as_of, train_end, val_end, test_start)。与 dataset.py 同源的交易日历。"""
+def resolve_split(db, test_days, val_days, as_of=None, train_end=None,
+                  val_end=None, train_start=None):
+    """返回 (as_of, train_end, val_end, test_start)。
+
+    与 dataset.py 同源的交易日历。两种模式：
+      - 未提供显式边界：按库内最新行情日自动倒推（与历史单次评估一致）；
+      - 显式边界：as_of/train_end/val_end 必须同时提供，均为交易日历内
+        日期且满足 train_end < val_end < as_of <= 库内最新行情日；
+        train_start 可选，限制最早训练目标日期（rolling），必须不晚于
+        train_end。
+    """
+    explicit = [as_of, train_end, val_end]
+    if any(x is not None for x in explicit):
+        if not all(x is not None for x in explicit):
+            raise ValueError(
+                "显式切分必须同时提供 --as-of、--train-end、--val-end"
+            )
+        as_of = pd.Timestamp(as_of).normalize()
+        train_end = pd.Timestamp(train_end).normalize()
+        val_end = pd.Timestamp(val_end).normalize()
+
     con = duckdb.connect(db, read_only=True)
     try:
         calendar, _ = ds.load_calendar(
@@ -99,27 +154,62 @@ def resolve_split(db, test_days, val_days):
         ).fetchone()[0]
         if value is None:
             raise ValueError("数据库没有后复权行情")
-        as_of = pd.Timestamp(value).normalize()
-        if as_of not in calendar:
-            raise ValueError(f"as-of {as_of.date()} 不在交易日历内")
+        latest = pd.Timestamp(value).normalize()
+
+        if as_of is None:
+            as_of = latest
+            if as_of not in calendar:
+                raise ValueError(f"as-of {as_of.date()} 不在交易日历内")
+            upto = calendar[calendar <= as_of]
+            # 全局日期的粗略下限检查；单股样本是否达标由 prepare_one() 判断。
+            need = test_days + val_days + 300
+            if len(upto) < need:
+                raise ValueError(f"交易日不足：{len(upto)} < {need}")
+            val_end = upto[-(test_days + 1)]
+            train_end = upto[-(test_days + val_days + 1)]
+        elif as_of > latest:
+            raise ValueError(
+                f"as-of {as_of.date()} 晚于库内最新行情日 {latest.date()}；"
+                "walk-forward 历史折的 as-of 不能超过库内数据"
+            )
+
+        for name, boundary in (
+            ("as-of", as_of),
+            ("train-end", train_end),
+            ("val-end", val_end),
+        ):
+            if boundary not in calendar:
+                raise ValueError(f"{name}={boundary.date()} 不在交易日历")
+
+        if not train_end < val_end < as_of:
+            raise ValueError("必须满足 train-end < val-end < as-of")
+
         if calendar.get_loc(as_of) + 1 >= len(calendar):
             raise ValueError("交易日历缺少 as-of 之后的下一交易日")
-        upto = calendar[calendar <= as_of]
-        # 全局日期的粗略下限检查；单股样本是否达标由 prepare_one() 判断。
-        need = test_days + val_days + 300
-        if len(upto) < need:
-            raise ValueError(f"交易日不足：{len(upto)} < {need}")
-        val_end = upto[-(test_days + 1)]
-        train_end = upto[-(test_days + val_days + 1)]
-        test_start = upto[-test_days]
+
+        if train_start is not None:
+            start = pd.Timestamp(train_start).normalize()
+            if start not in calendar:
+                raise ValueError(
+                    f"train-start={start.date()} 不在交易日历"
+                )
+            if start > train_end:
+                raise ValueError("train-start 不能晚于 train-end")
+
+        test_start = calendar[calendar.get_loc(val_end) + 1]
         return as_of, train_end, val_end, test_start
     finally:
         con.close()
 
 
 def init_worker(db, data_root, as_of, train_end, val_end,
-                seq_len, min_train_samples, min_eval_samples):
-    """进程级初始化：只读 duckdb 连接 + 交易日历 + 预处理配置。"""
+                seq_len, min_train_samples, min_eval_samples,
+                train_start=None):
+    """进程级初始化：只读 duckdb 连接 + 交易日历 + 预处理配置。
+
+    train_start 为 "YYYY-MM-DD" 或 None：rolling 训练窗口的最早目标日，
+    传入 dataset.py 的 --start（保留原始历史用于窗口与指标预热）。
+    """
     con = duckdb.connect(db, read_only=True)
     calendar, calendar_info = ds.load_calendar(
         con, None, ds.DEFAULT_CALENDAR_START, 50
@@ -149,7 +239,7 @@ def init_worker(db, data_root, as_of, train_end, val_end,
         calendar=None, calendar_start=ds.DEFAULT_CALENDAR_START,
         min_market_symbols=50,
         symbol=None, industry=None, top=None, baidu_keyword=None,
-        as_of=str(as_of.date()), start=None, tail=None,
+        as_of=str(as_of.date()), start=train_start, tail=None,
         train_end=str(train_end.date()), val_end=str(val_end.date()),
         seq_len=seq_len, return_type="simple",
         min_train_samples=min_train_samples,
@@ -220,6 +310,9 @@ def export_one(row):
             or prep.get("min_observations") != args.min_observations
             or prep.get("train_end") != args.train_end
             or prep.get("val_end") != args.val_end
+            or prep.get("sample_selection") != {
+                "start": args.start, "tail": args.tail,
+            }
         ):
             raise ValueError("已有导出的预处理配置或日历与本次任务不一致")
 
@@ -275,19 +368,27 @@ def main():
         raise ValueError("股票池存在重复股票代码")
 
     as_of, train_end, val_end, test_start = resolve_split(
-        a.db, a.test_days, a.val_days
+        a.db, a.test_days, a.val_days,
+        as_of=a.as_of, train_end=a.train_end, val_end=a.val_end,
+        train_start=a.train_start,
+    )
+    # 统一为 "YYYY-MM-DD"，与 preprocessing.json 的 sample_selection 一致。
+    train_start = (
+        str(pd.Timestamp(a.train_start).normalize().date())
+        if a.train_start else None
     )
 
     root = Path(a.data_root)
     root.mkdir(parents=True, exist_ok=True)
 
     spec = {
-        "export_version": "global_export_v2",
+        "export_version": "global_export_wf_v1",
         "db": str(Path(a.db).resolve()),
         "as_of": str(as_of.date()),
         "train_end": str(train_end.date()),
         "val_end": str(val_end.date()),
         "test_start": str(test_start.date()),
+        "train_start": train_start,
         "seq_len": a.seq_len,
         "min_train_samples": a.min_train_samples,
         "min_eval_samples": a.min_eval_samples,
@@ -331,6 +432,7 @@ def main():
             a.seq_len,
             a.min_train_samples,
             a.min_eval_samples,
+            train_start,
         ),
     ) as pool:
         futures = {
