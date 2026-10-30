@@ -602,6 +602,14 @@ def main():
     ) < 1:
         raise ValueError("数量参数必须为正数")
 
+    # 提前拦截：否则要等昂贵的数据导出跑完、到训练子进程才报错
+    # （train_global_timexer.py 与 TimeXer 模型构造处还有两层校验）。
+    if a.patch_len < 1 or a.seq_len % a.patch_len:
+        raise ValueError(
+            "patch-len 必须为正数且整除 seq-len（TimeXer 内生 patch 从窗口"
+            "起点切，非整除会丢弃最新的尾部目标历史）"
+        )
+
     if a.train_days is not None and a.train_days < 1:
         raise ValueError("train-days 必须为正数")
 

@@ -122,6 +122,15 @@ class Model(nn.Module):
         self.use_norm = configs.use_norm
         self.patch_len = configs.patch_len
         self.patch_num = int(configs.seq_len // configs.patch_len)
+        # N = floor(T / P) follows the paper, but the paper leaves the remainder
+        # end unspecified: EnEmbedding patches with unfold(size=P, step=P) from the
+        # window start, so a non-divisible seq_len silently drops the NEWEST
+        # seq_len % P points -- the worst end to lose for forecasting. Fail fast
+        # at construction instead.
+        assert self.patch_num * self.patch_len == self.seq_len, (
+            f'seq_len={self.seq_len} must be divisible by patch_len={self.patch_len}: '
+            f'otherwise the newest {self.seq_len - self.patch_num * self.patch_len} '
+            'points are silently dropped by the endogenous patching')
         self.n_vars = 1 if configs.features == 'MS' else configs.enc_in
         # Embedding
         self.en_embedding = EnEmbedding(self.n_vars, configs.d_model, self.patch_len, configs.dropout)

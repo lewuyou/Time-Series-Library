@@ -138,7 +138,9 @@ if __name__ == '__main__':
     parser.add_argument('--extra_tag', type=str, default="", help="Anything extra")
 
     # TimeXer
-    parser.add_argument('--patch_len', type=int, default=16, help='patch length')
+    parser.add_argument('--patch_len', type=int, default=16,
+                        help='patch length, must evenly divide --seq_len '
+                             '(TimeXer endogenous patching drops the newest seq_len % patch_len points otherwise)')
 
     # GCN
     parser.add_argument('--node_dim', type=int, default=10, help='each node embbed to dim dimentions')
