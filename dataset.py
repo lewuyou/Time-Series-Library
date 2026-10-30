@@ -78,6 +78,12 @@ infer 模式的历史快照一致性：
     rzrq 比率字段原单位为百分数，/100.0 转为小数是正确的；
     akshare_tx.volume 单位为股，特征使用 log1p；turnover 本身即小数。
 
+目标日星期 one-hot（target_dow_mon..fri，v8 起）：
+    每行的目标日 = 下一交易日（该行作为输入日时的预测目标）。
+    星期是已知的日历信息，不引入未来数据；样本窗口最后一行
+    （决策行）即该样本目标日的星期，与 latest.npz 的 target_date
+    口径一致。one-hot 保持 0/1，不标准化、恒不缺失。
+
 运行示例：
     # 单股训练数据（as-of 默认取库内最新行情日）
     python dataset.py --symbol 601398 \\
@@ -161,14 +167,16 @@ except Exception:  # torch 仅训练读取需要，预处理可不安装
     HAS_TORCH = False
 
 
-VERSION = "stock_timexer_v7"
+VERSION = "stock_timexer_v8"
 # 可读取的历史版本：旧版缺少日历指纹、sample_selection、split_layout、
 # label_valid 等新增字段，infer 按兼容逻辑回退旧行为并提示。
 # v7 起 samples.csv 区分"可预测"（input_eligible，行保留）与"可评分"
 # （label_valid=True），且单股仅强制训练样本下限，验证/测试覆盖率只登记。
+# v8 起特征加入目标日星期 one-hot（target_dow_mon..fri，保持 0/1
+# 不标准化）；旧版 preprocessor infer 仍兼容（one-hot 列被计算但不使用）。
 COMPATIBLE_VERSIONS = (
     "stock_timexer_v3", "stock_timexer_v4", "stock_timexer_v5",
-    "stock_timexer_v6", "stock_timexer_v7",
+    "stock_timexer_v6", "stock_timexer_v7", "stock_timexer_v8",
 )
 
 # 样本划分布局：
@@ -178,6 +186,8 @@ COMPATIBLE_VERSIONS = (
 # 已成为历史，可以进入最终训练；测试集不参与任何训练期决策。
 SPLIT_LAYOUTS = ("train_val_test", "train_test")
 TARGET = "stock_return"
+# 目标日星期 one-hot 列名后缀（pandas dayofweek 0=周一 ... 4=周五）。
+TARGET_DOW_NAMES = ("mon", "tue", "wed", "thu", "fri")
 
 DEFAULT_DB = "../AutoTS/download/autots.duckdb"
 DEFAULT_CALENDAR_START = "2016-01-01"
@@ -784,6 +794,19 @@ def build_features(prices, calendar, as_of, specs, config):
     # aligned_values.csv 中 px_volume 仍保留原值。
     features["px_volume"] = np.log1p(features["px_volume"])
 
+    # 目标日星期 one-hot（周一~周五）：行 t 的目标日 = 以该行为输入日
+    # 时的预测目标，即下一交易日（decision 的日期部分）。星期是纯日历
+    # 信息，预测时点完全已知，不引入未来数据；样本窗口 [start..end] 的
+    # 目标日 date[end+1] 的 one-hot 恰为窗口最后一行（决策行），窗口内
+    # 其余各行各自表示"以该行为输入日"的目标日星期（窗口互相重叠，
+    # 行级存储无法整窗恒定）。交易日只落在周一~周五，5 列完整覆盖；
+    # 恒不缺失，不生成 __missing / __age_days 伴随列，也不参与屏蔽。
+    target_dow = next_date.reindex(index).dt.dayofweek
+    for i, name in enumerate(TARGET_DOW_NAMES):
+        col = f"target_dow_{name}"
+        features[col] = (target_dow == i).astype(float)
+        groups[col] = [col]
+
     # 辅助来源按各自的可用时间对齐，禁止 bfill。
     audit = pd.DataFrame({"decision_time": decision}, index=index)
     raw_aux, aux_columns, audits = {}, {}, []
@@ -960,6 +983,11 @@ def fit_preprocessing(features, samples, groups, min_coverage, min_obs):
         if col.endswith("__missing"):
             # 二值标记保持 0/1。
             stats[col] = {"median": 1.0, "mean": 0.0, "scale": 1.0}
+            continue
+
+        if col.startswith("target_dow_"):
+            # 目标日星期 one-hot 保持 0/1，不标准化。
+            stats[col] = {"median": 0.0, "mean": 0.0, "scale": 1.0}
             continue
 
         median = float(values.median())
