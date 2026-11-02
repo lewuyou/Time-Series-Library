@@ -16,9 +16,17 @@ exogenous_mask_layout / compute_ex_mask）各写一份布局规则，改特征�
 张量对齐函数除外），供 dataset.py 安全引用。
 """
 
+import hashlib
+import json
+
 import numpy as np
 
 TARGET = "stock_return"
+
+#: 特征列布局版本。列名/顺序/分组语义变化时递增；写入导出目录与
+#: checkpoint，推理契约不匹配即报错（旧产物缺字段时显式告警）。
+FEATURE_SCHEMA_VERSION = "stock_features_v1"
+
 
 # 伴随列后缀与目标日星期前缀（pandas dayofweek 0=周一 ... 4=周五）。
 MISSING_SUFFIX = "__missing"
@@ -134,3 +142,58 @@ def compute_ex_mask(x, layout):
         masked = (x[..., layout[:, 1]] == 1.0).all(axis=-2)
         ex_mask[..., layout[:, 0]] = masked
     return ex_mask
+
+
+def feature_group(column):
+    """特征列的分组标签（仅用于审计与可视化，不参与计算）。"""
+    if column == TARGET:
+        return "target"
+    if is_dow_col(column):
+        return "calendar"
+    if is_missing_col(column):
+        return "missing_flag"
+    if is_age_col(column):
+        return "availability"
+    if is_exogenous_col(column):
+        return "exogenous:" + column.split("_", 1)[0]
+    return "price"
+
+
+def feature_schema(schema):
+    """生成特征 schema 描述（name/order/dtype/group）。
+
+    dtype 记录的是实际落盘矩阵类型（统一 float32）；语义差异由
+    group 承担，避免把 0/1 标记硬说成 bool 而与 mmap 不一致。
+    """
+    columns = []
+    for order, name in enumerate(schema):
+        columns.append({
+            "name": name,
+            "order": order,
+            "dtype": "float32",
+            "group": feature_group(name),
+        })
+    return columns
+
+
+def feature_schema_hash(columns):
+    """稳定 hash：只依赖版本与列描述，不依赖 dict 插入顺序。"""
+    payload = {
+        "version": FEATURE_SCHEMA_VERSION,
+        "columns": columns,
+    }
+    text = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def feature_schema_doc(schema):
+    """可直接写入 JSON 的 schema 文档（含稳定 hash）。"""
+    columns = feature_schema(schema)
+    return {
+        "version": FEATURE_SCHEMA_VERSION,
+        "hash": feature_schema_hash(columns),
+        "columns": columns,
+    }
+

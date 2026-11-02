@@ -50,6 +50,7 @@ import pandas as pd
 import torch
 
 from stock.adapters import adapter_for_checkpoint
+from stock.inference.contracts import PredictionStatus
 from stock.inference.predictor import score
 from stock.selection.rules import hybrid_signal
 
@@ -147,7 +148,7 @@ def main():
     )[["symbol", "name", "industry_l2"]]
     frame = frame.merge(universe, on="symbol", how="left")
 
-    ok = frame[frame.note == "ok"].copy()
+    ok = frame[frame.status == PredictionStatus.OK.value].copy()
     stale = ok[ok.input_date != ok.input_date.max()]
     valid = ok[ok.input_date == ok.input_date.max()].copy()
 
@@ -157,14 +158,19 @@ def main():
     if len(target_dates) > 1:
         print(f"[WARN] 目标日不一致 {list(target_dates)}，以 {target_date} 为准")
 
-    # 混合规则（共享实现）：排名前 q% 且预测 > 下限；pred_return_pct 与
-    # floor_pct 同为百分数单位。
+    # 混合规则（共享实现）：排名前 q% 且预测 > 下限。
+    # 生产口径：pred_return_pct 与 floor_pct 同为百分数；命中分析则是
+    # 小数 pred + floor_decimal=0.5/100。两者数值等价但单位不同，必须
+    # 显式声明，禁止在重构时"顺手统一"（会差 100 倍）。
     valid = valid.sort_values("pred_return_pct", ascending=False).reset_index(drop=True)
     n = len(valid)
-    rule = hybrid_signal(valid["pred_return_pct"], args.quantile_pct, args.floor_pct)
+    rule = hybrid_signal(
+        valid["pred_return_pct"], args.quantile_pct,
+        floor_pct=args.floor_pct, pred_unit="pct",
+        symbol=valid["symbol"], eligible=valid["symbol"].tolist(),
+    )
     for column in ("rank", "quantile_pass", "floor_pass", "signal"):
         valid[column] = rule[column].to_numpy()
-    valid.loc[valid.signal, "note"] = "signal"
 
     print(f"\n== 数据新鲜度 ==")
     print(f"输入行情日（t）：{input_date}  预测目标日（t+1）：{target_date}")
@@ -207,7 +213,7 @@ def main():
     out_path = out_dir / f"predict_{target_date}.csv"
     columns = ["rank", "symbol", "name", "industry_l2", "input_date",
                "target_date", "pred_return_pct", "quantile_pass",
-               "floor_pass", "signal", "note"]
+               "floor_pass", "signal", "status"]
     full = valid.reindex(columns=columns)
     full.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n全池明细已保存：{out_path}")

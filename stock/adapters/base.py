@@ -18,6 +18,13 @@ class ModelAdapter(abc.ABC):
     name = ""
     #: checkpoint 登记格式号（"format" 字段）
     checkpoint_format = ""
+    #: 该模型专属的 CLI 参数名；walk_forward / train_stock 只透传这些。
+    #: 通用参数（batch-size/lr/device 等）不属于任何模型。
+    cli_params = ()
+
+    def validate_args(self, args, seq_len):
+        """在启动昂贵流程前校验模型专属参数（默认无约束）。"""
+        return None
 
     @abc.abstractmethod
     def model_config(self, args, seq_len, schema):

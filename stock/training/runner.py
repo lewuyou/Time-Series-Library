@@ -25,11 +25,12 @@ from torch.utils.data import DataLoader
 
 from stock.adapters import get_adapter
 from stock.data.panel import PanelWindows, load_catalog
+from stock.data.schema import feature_schema_doc
 from stock.inference.predictor import predict
 from stock.training.artifacts import environment_info, prediction_time
 from stock.training.trainer import run_epoch, test_predictions
 from stock.evaluation.metrics import save_test_report
-from stock.utils import now_text, read_json, write_json
+from stock.utils import now_text, read_json, sha256_file, write_json
 
 
 def train(args, device):
@@ -90,12 +91,20 @@ def train(args, device):
     )
 
     spec = read_json(Path(args.data_root) / "export_config.json")
+    schema_info = feature_schema_doc(schema)
 
     metadata = {
         "format": adapter.checkpoint_format,
         "model": adapter.name,
         "model_config": config,
         "schema": schema,
+        # 特征契约：完整列描述 + 稳定 hash；推理端按同一算法重算，
+        # 不匹配即报错（旧产物缺字段时显式告警，见 predictor）。
+        "feature_schema": schema_info,
+        "feature_schema_hash": schema_info["hash"],
+        # 数据集身份：导出配置字节哈希，便于预测记录回溯到数据口径。
+        "dataset_id": sha256_file(Path(args.data_root) / "export_config.json"),
+        "target_spec": records[0]["prep"].get("target_spec"),
         # 登记导出任务配置：本折数据截止日、训练起点、训练/验证边界、
         # 脚本与数据哈希，checkpoint 可直接追溯到生成它的数据口径
         # （walk-forward 每折不同）。
@@ -215,6 +224,7 @@ def train(args, device):
     }
     write_json(out / "selection_result.json", selection_result)
     write_json(out / "schema.json", schema)
+    write_json(out / "feature_schema.json", schema_info)
 
     # 训练结束、模型选定后，才执行测试预测（测试集按 allow_missing 装载，
     # 单股无测试样本只影响该股评估；整体为空说明测试块配置有问题）。
@@ -340,6 +350,7 @@ def train_refit(args, device):
     train_loader = DataLoader(train_ds, shuffle=True, **loader_options)
 
     spec = read_json(Path(args.data_root) / "export_config.json")
+    schema_info = feature_schema_doc(schema)
 
     model = adapter.build_model(config).to(device)
     optimizer = torch.optim.AdamW(
@@ -357,6 +368,10 @@ def train_refit(args, device):
         "model": adapter.name,
         "model_config": config,
         "schema": schema,
+        "feature_schema": schema_info,
+        "feature_schema_hash": schema_info["hash"],
+        "dataset_id": sha256_file(Path(args.data_root) / "export_config.json"),
+        "target_spec": records[0]["prep"].get("target_spec"),
         "export_config": spec,
         "preprocessing": {
             r["symbol"]: r["prep"] for r in records
@@ -443,6 +458,7 @@ def train_refit(args, device):
         )
 
     write_json(out / "schema.json", schema)
+    write_json(out / "feature_schema.json", schema_info)
 
     first_prediction = prediction_time(spec)
     fit_metadata = {

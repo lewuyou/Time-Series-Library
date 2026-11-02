@@ -49,6 +49,21 @@ def build_model(config):
 class TimeXerAdapter(ModelAdapter):
     name = "TimeXer"
     checkpoint_format = "global_timexer_typed_v1"
+    # 模型专属参数：调度器按此声明组装命令，禁止无条件透传。
+    cli_params = (
+        "d_model", "e_layers", "n_heads", "patch_len", "dropout", "ex_mask",
+    )
+
+    def validate_args(self, args, seq_len):
+        if args.patch_len < 1 or seq_len % args.patch_len:
+            raise ValueError(
+                "patch-len 必须为正数且整除 seq-len（TimeXer 内生 patch 从"
+                "窗口起点切，非整除会丢弃最新的尾部目标历史）"
+            )
+        if args.d_model < 1 or args.n_heads < 1:
+            raise ValueError("d-model / n-heads 必须为正数")
+        if args.d_model % args.n_heads:
+            raise ValueError("d-model 必须能被 n-heads 整除")
 
     def model_config(self, args, seq_len, schema):
         return {

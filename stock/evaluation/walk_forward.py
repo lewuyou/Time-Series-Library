@@ -157,6 +157,7 @@ import pandas as pd
 
 import dataset as ds
 
+from stock.adapters import get_adapter
 from stock.evaluation.metrics import save_test_report
 from stock.utils import date_text
 
@@ -316,30 +317,36 @@ def export_command(a, db, universe, data_root, fold, layout,
 
 
 def train_command(a, data_root, out_dir, mode, epochs=None, extra=None):
-    """构造 train_stock.py 命令（共享模型参数一份）。"""
+    """构造 train_stock.py 命令（共享模型参数一份）。
+
+    模型专属参数由适配器的 cli_params 声明；调度器不再写死 TimeXer，
+    也不会把 TimeXer 参数透传给其他模型。
+    """
+    adapter = get_adapter(getattr(a, "model", "TimeXer"))
     command = [
         sys.executable,
         str(SCRIPT_DIR / "train_stock.py"),
-        "--model", "TimeXer",
+        "--model", adapter.name,
         "--mode", mode,
         "--data-root", str(data_root),
         "--out-dir", str(out_dir),
         "--batch-size", str(a.batch_size),
         "--workers", str(a.loader_workers),
-        "--d-model", str(a.d_model),
-        "--e-layers", str(a.e_layers),
-        "--n-heads", str(a.n_heads),
-        "--patch-len", str(a.patch_len),
         "--lr", str(a.lr),
-        "--dropout", str(a.dropout),
         "--weight-decay", str(a.weight_decay),
         "--seed", str(a.seed),
         "--device", a.device,
     ]
-    # 外生 token 掩码协议：选择 / 重拟合两阶段一致透传，
-    # 与 train_stock.py 的 --ex-mask 对应（默认关闭）。
-    if getattr(a, "ex_mask", False):
-        command += ["--ex-mask"]
+    for name in adapter.cli_params:
+        value = getattr(a, name, None)
+        if value is None:
+            continue
+        flag = "--" + name.replace("_", "-")
+        if isinstance(value, bool):
+            if value:
+                command.append(flag)
+        else:
+            command += [flag, str(value)]
     if epochs is not None:
         command += ["--epochs", str(epochs)]
     if mode == "train":
@@ -556,6 +563,10 @@ def parse_args():
     )
 
     p.add_argument("--seq-len", type=int, default=60)
+    p.add_argument(
+        "--model", default="TimeXer",
+        help="模型适配器名（stock.adapters 注册）；专属参数由适配器声明",
+    )
     p.add_argument("--min-train-samples", type=int, default=250)
     p.add_argument(
         "--min-eval-samples", type=int, default=20,
@@ -602,13 +613,10 @@ def main():
     ) < 1:
         raise ValueError("数量参数必须为正数")
 
-    # 提前拦截：否则要等昂贵的数据导出跑完、到训练子进程才报错
-    # （train_stock.py 与 TimeXer 模型构造处还有两层校验）。
-    if a.patch_len < 1 or a.seq_len % a.patch_len:
-        raise ValueError(
-            "patch-len 必须为正数且整除 seq-len（TimeXer 内生 patch 从窗口"
-            "起点切，非整除会丢弃最新的尾部目标历史）"
-        )
+    # 提前拦截：否则要等昂贵的数据导出跑完、到训练子进程才报错。
+    # 校验规则由模型适配器声明（不同模型的内生约束不同）。
+    adapter = get_adapter(a.model)
+    adapter.validate_args(a, a.seq_len)
 
     if a.train_days is not None and a.train_days < 1:
         raise ValueError("train-days 必须为正数")
@@ -679,6 +687,7 @@ def main():
         (root / "oos").mkdir()
 
         plan = {
+            "model": a.model,
             "protocol": (
                 "train_val_refit_v1" if a.refit
                 else "independent_train_val_test_v1"

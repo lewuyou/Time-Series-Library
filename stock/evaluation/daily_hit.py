@@ -44,7 +44,13 @@ def daily_hit(frame, q_pct, floor_pct):
     rows = []
     for date, part in frame.groupby("target_date"):
         # 分位截断逐日计算（当日股票数 n），不能跨日池化排名
-        signal = hybrid_signal(part["y_pred"], q_pct, floor_pct / 100.0)["signal"]
+        # 命中分析口径：y_pred 为小数收益率，floor 0.5% 换算为 0.5/100；
+        # 与生产链路（百分数 pred + floor_pct=0.5）数值等价、单位不同。
+        signal = hybrid_signal(
+            part["y_pred"], q_pct,
+            floor_decimal=floor_pct / 100.0, pred_unit="decimal",
+            symbol=part["symbol"], eligible=part["symbol"].tolist(),
+        )["signal"]
         sig = part[signal]
         hits = (sig.y_true > 0).sum() if len(sig) else 0
         rows.append({
@@ -92,7 +98,13 @@ def daily_hit(frame, q_pct, floor_pct):
 def per_stock(frame, q_pct, floor_pct):
     rows = []
     for date, part in frame.groupby("target_date"):
-        signal = hybrid_signal(part["y_pred"], q_pct, floor_pct / 100.0)["signal"]
+        # 命中分析口径：y_pred 为小数收益率，floor 0.5% 换算为 0.5/100；
+        # 与生产链路（百分数 pred + floor_pct=0.5）数值等价、单位不同。
+        signal = hybrid_signal(
+            part["y_pred"], q_pct,
+            floor_decimal=floor_pct / 100.0, pred_unit="decimal",
+            symbol=part["symbol"], eligible=part["symbol"].tolist(),
+        )["signal"]
         rows.append(part[signal].assign(target_date=date))
     sig_all = pd.concat(rows) if rows else frame.iloc[0:0]
     if not len(sig_all):

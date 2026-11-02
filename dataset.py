@@ -166,11 +166,18 @@ from stock.data.schema import (
     TARGET_DOW_NAMES,
     age_col,
     dow_column,
+    feature_schema_doc,
     is_companion_col,
     is_dow_col,
     is_exogenous_col,
     is_missing_col,
     missing_col,
+)
+# 目标定义（公式 / 有效位 / 登记内容）的单一事实源。
+from stock.data.targets import (
+    label_valid as is_label_valid,
+    target_series,
+    target_spec,
 )
 # JSON 原子写 / 文件哈希：全仓唯一实现（旧 json_write/sha256_file
 # 本地副本删除，名字保留别名以兼容 ds.json_write 调用方）。
@@ -750,12 +757,8 @@ def build_features(prices, calendar, as_of, specs, config):
     p.loc[p["volume"] < 0, "volume"] = np.nan
 
     prev = p["close"].shift(1)
-    simple_return = p["close"] / prev - 1.0
-    target = (
-        np.log(p["close"] / prev)
-        if config["return_type"] == "log"
-        else simple_return
-    )
+    simple_return = target_series(p["close"], "simple")
+    target = target_series(p["close"], config["return_type"])
 
     raw = p.rename(columns={c: f"px_{c}" for c in PRICE_FIELDS})
 
@@ -908,10 +911,8 @@ def make_samples(features, core_valid, config, train_end, val_end,
             exclusions["invalid_input_window"] += 1
             continue
 
-        label_valid = bool(
-            valid[target_pos] and np.isfinite(y[target_pos])
-        )
-        if not label_valid:
+        label_ok = is_label_valid(valid[target_pos], y[target_pos])
+        if not label_ok:
             exclusions["invalid_target_label"] += 1
 
         if split_layout == "train_test":
@@ -929,8 +930,8 @@ def make_samples(features, core_valid, config, train_end, val_end,
             "input_date": index[end],
             "target_date": target_date,
             "split": split,
-            "label_valid": label_valid,
-            "y_raw": float(y[target_pos]) if label_valid else np.nan,
+            "label_valid": label_ok,
+            "y_raw": float(y[target_pos]) if label_ok else np.nan,
         })
 
     columns = [
@@ -1302,6 +1303,17 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
             "calendar": calendar_fingerprint(
                 calendar, as_of, calendar_info
             ),
+            # 特征 schema 版本 + 稳定 hash（完整列描述另存
+            # feature_schema.json，避免 252 只股票各存一份大 JSON）。
+            "feature_schema": {
+                key: value
+                for key, value in feature_schema_doc(
+                    preprocessing["feature_columns"]
+                ).items()
+                if key != "columns"
+            },
+            # 目标定义登记：预测标签不等同于可执行收益（后者见回测层）。
+            "target_spec": target_spec(config["return_type"]),
         })
 
         report = coverage_report(
@@ -1352,6 +1364,16 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
         }
 
     matrix = transform(features, preprocessing)
+    # 旧导出目录（v8 及以前）没有登记 feature_schema/target_spec：infer
+    # 时按当前列与配置补算，只用于写入本次 manifest，不回写冻结的
+    # preprocessing（避免改变历史产物的契约）。
+    schema_doc = feature_schema_doc(preprocessing["feature_columns"])
+    schema_ref = preprocessing.get("feature_schema") or {
+        key: value for key, value in schema_doc.items() if key != "columns"
+    }
+    target_reg = preprocessing.get("target_spec") or target_spec(
+        config["return_type"]
+    )
 
     warnings = []
     # 最新输入行的辅助特征缺失/过期（数据未到或超出 max_age）。
@@ -1450,6 +1472,12 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
             temp, matrix, features, core_valid, calendar, config
         )
         json_write(temp / "preprocessing.json", preprocessing)
+        # 完整特征列描述（name/order/dtype/group + hash）：供审计与未来
+        # 跨模型契约校验；preprocessing/manifest 只存版本与 hash 引用。
+        json_write(
+            temp / "feature_schema.json",
+            schema_doc,
+        )
 
         manifest = {
             "version": VERSION,
@@ -1480,6 +1508,8 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
             "pred_len": 1,
             "return_type": config["return_type"],
             "target": TARGET,
+            "target_spec": target_reg,
+            "feature_schema": schema_ref,
             "enc_in": matrix.shape[1],
             "matrix_shape": list(matrix.shape),
             "latest": latest,

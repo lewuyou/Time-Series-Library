@@ -18,8 +18,59 @@ from stock.data.schema import (
     align_features,
     compute_ex_mask,
     exogenous_mask_layout,
+    feature_schema_doc,
 )
-from stock.utils import read_json
+from stock.inference.contracts import PredictionStatus
+from stock.utils import read_json, sha256_file
+
+
+def verify_feature_schema(saved, prep):
+    """校验 checkpoint 与推理预处理的特征契约。
+
+    新产物（带 feature_schema）严格比对 hash，不匹配即报错；
+    旧产物（v8 及以前）缺少该字段时，按列重算并显式告警，避免把
+    "缺字段"当成"匹配"而静默兼容。
+    """
+    expected = feature_schema_doc(saved["schema"])
+    stored = saved.get("feature_schema")
+    if stored is None:
+        print(
+            "[WARN] checkpoint 缺少 feature_schema（旧产物），"
+            f"按当前列重算 hash={expected['hash']}；建议重训以固化契约"
+        )
+    else:
+        if stored.get("version") != expected["version"]:
+            raise ValueError(
+                "特征 schema 版本不一致："
+                f"checkpoint={stored.get('version')!r}，当前={expected['version']!r}"
+            )
+        if stored.get("hash") != expected["hash"]:
+            raise ValueError(
+                "checkpoint 特征 schema hash 与自身列不一致："
+                f"{stored.get('hash')} != {expected['hash']}"
+            )
+
+    prep_expected = feature_schema_doc(prep["feature_columns"])
+    stored_prep = prep.get("feature_schema")
+    if stored_prep is None:
+        print(
+            f"[WARN] 股票 {prep.get('symbol')} 的预处理缺少 feature_schema"
+            f"（旧产物），按列重算 hash={prep_expected['hash']}"
+        )
+    elif stored_prep.get("hash") != prep_expected["hash"]:
+        raise ValueError(
+            f"股票 {prep.get('symbol')} 预处理特征 schema hash 不一致："
+            f"{stored_prep.get('hash')} != {prep_expected['hash']}"
+        )
+
+    missing = set(prep["feature_columns"]) - set(saved["schema"])
+    if missing:
+        raise ValueError(
+            "推理预处理包含 checkpoint schema 之外的特征列："
+            f"{sorted(missing)}"
+        )
+    return expected
+
 
 
 @torch.no_grad()
@@ -43,6 +94,7 @@ def predict(args, device):
         )
     if prep != saved["preprocessing"][symbol]:
         raise ValueError("推理预处理参数与训练期不一致")
+    schema_info = verify_feature_schema(saved, prep)
 
     with np.load(directory / "latest.npz") as latest:
         x = align_features(
@@ -76,12 +128,16 @@ def predict(args, device):
     if not np.isfinite(value):
         raise FloatingPointError("预测结果不是有限数值")
 
+    model_id = saved.get("model_id") or sha256_file(args.checkpoint)[:16]
     print(json.dumps({
         "symbol": symbol,
-        "input_date": input_date,
+        "as_of_date": input_date,
         "target_date": target_date,
-        "predicted_simple_return": value,
+        "model_id": model_id,
+        "feature_schema_hash": schema_info["hash"],
+        "y_pred": value,
         "predicted_return_percent": value * 100.0,
+        "status": PredictionStatus.OK.value,
     }, ensure_ascii=False, indent=2))
 
 
@@ -104,26 +160,36 @@ def score(args, saved, device, infer_root):
 
     rows, arrays, masks, symbols = [], [], [], []
     for symbol, prep in saved["preprocessing"].items():
+        verify_feature_schema(saved, prep)
         path = infer_root / symbol / "latest.npz"
         if not path.exists():
-            rows.append({"symbol": symbol, "note": "no_infer_output"})
+            rows.append({
+                "symbol": symbol, "status": PredictionStatus.NO_INFER_OUTPUT.value,
+            })
             continue
         with np.load(path, allow_pickle=True) as latest:
             x = align_features(latest["X"], prep["feature_columns"], schema)
             input_date = str(latest["input_date"][0])
             target_date = str(latest["target_date"][0])
         if x.shape != (1, config["seq_len"], config["enc_in"]):
-            rows.append({"symbol": symbol, "note": f"bad_shape_{x.shape}"})
+            rows.append({
+                "symbol": symbol, "status": PredictionStatus.BAD_SHAPE.value,
+                "input_date": input_date, "target_date": target_date,
+                "detail": str(x.shape),
+            })
             continue
         if not np.isfinite(x).all():
-            rows.append({"symbol": symbol, "note": "non_finite"})
+            rows.append({
+                "symbol": symbol, "status": PredictionStatus.NON_FINITE.value,
+                "input_date": input_date, "target_date": target_date,
+            })
             continue
         arrays.append(x[0])
         if use_ex_mask:
             masks.append(compute_ex_mask(x, layout)[0])
         symbols.append(symbol)
         rows.append({
-            "symbol": symbol, "note": "ok",
+            "symbol": symbol, "status": PredictionStatus.OK.value,
             "input_date": input_date, "target_date": target_date,
         })
     if not arrays:
@@ -147,9 +213,10 @@ def score(args, saved, device, infer_root):
         preds.append(out.reshape(-1).cpu().numpy())
 
     frame = pd.DataFrame(rows).set_index("symbol")
+    frame["y_pred"] = np.nan
     for symbol, z in zip(symbols, np.concatenate(preds)):
         stats = saved["preprocessing"][symbol]["statistics"][TARGET]
-        frame.loc[symbol, "pred_return_pct"] = (
-            z * stats["scale"] + stats["mean"]
-        ) * 100.0
+        value = z * stats["scale"] + stats["mean"]
+        frame.loc[symbol, "y_pred"] = value
+        frame.loc[symbol, "pred_return_pct"] = value * 100.0
     return frame.reset_index()
