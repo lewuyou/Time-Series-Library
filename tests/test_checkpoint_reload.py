@@ -89,7 +89,11 @@ def test_strict_mismatch_raises():
     with pytest.raises(ValueError, match="hash"):
         verify_feature_schema(saved, prep)
 
-    saved["feature_schema"] = feature_schema_doc(schema)
+
+def test_extra_prep_columns_warn_but_do_not_break_legacy(capsys):
+    schema = ["px_close_ret", "px_volume_log", "stock_return"]
+    saved = _saved(schema)
+    prep = _prep(schema)
     prep["feature_columns"] = prep["feature_columns"] + ["extra_col"]
     prep["feature_schema"] = {
         key: value
@@ -98,8 +102,10 @@ def test_strict_mismatch_raises():
         ).items()
         if key != "columns"
     }
-    with pytest.raises(ValueError, match="之外"):
-        verify_feature_schema(saved, prep)
+    verify_feature_schema(saved, prep)
+    captured = capsys.readouterr()
+    assert "schema 之外的列" in captured.out
+    assert "extra_col" in captured.out
 
 
 def test_legacy_artifacts_warn_but_do_not_silently_claim_match(capsys):

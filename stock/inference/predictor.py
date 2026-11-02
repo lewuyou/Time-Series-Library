@@ -24,20 +24,24 @@ from stock.inference.contracts import PredictionStatus
 from stock.utils import read_json, sha256_file
 
 
-def verify_feature_schema(saved, prep):
+def verify_feature_schema(saved, prep, warn_checkpoint=True):
     """校验 checkpoint 与推理预处理的特征契约。
 
     新产物（带 feature_schema）严格比对 hash，不匹配即报错；
     旧产物（v8 及以前）缺少该字段时，按列重算并显式告警，避免把
     "缺字段"当成"匹配"而静默兼容。
+
+    warn_checkpoint=False 用于 score 的逐股循环：checkpoint 级告警只在
+    第一只股票打印一次，预处理级不一致仍然逐股报告。
     """
     expected = feature_schema_doc(saved["schema"])
     stored = saved.get("feature_schema")
     if stored is None:
-        print(
-            "[WARN] checkpoint 缺少 feature_schema（旧产物），"
-            f"按当前列重算 hash={expected['hash']}；建议重训以固化契约"
-        )
+        if warn_checkpoint:
+            print(
+                "[WARN] checkpoint 缺少 feature_schema（旧产物），"
+                f"按当前列重算 hash={expected['hash']}；建议重训以固化契约"
+            )
     else:
         if stored.get("version") != expected["version"]:
             raise ValueError(
@@ -63,11 +67,14 @@ def verify_feature_schema(saved, prep):
             f"{stored_prep.get('hash')} != {prep_expected['hash']}"
         )
 
-    missing = set(prep["feature_columns"]) - set(saved["schema"])
-    if missing:
-        raise ValueError(
-            "推理预处理包含 checkpoint schema 之外的特征列："
-            f"{sorted(missing)}"
+    # 预处理列多于 checkpoint schema 属于历史导出差异（如已从 schema
+    # 剔除的 px_* 原值列）：align_features 只按 schema 取列，多余列不参与
+    # 计算，故显式告警而不拒绝，避免旧 checkpoint 直接失效。
+    extra = set(prep["feature_columns"]) - set(saved["schema"])
+    if extra:
+        print(
+            f"[WARN] 股票 {prep.get('symbol')} 预处理包含 schema 之外的列"
+            f"{sorted(extra)}（按 schema 对齐后忽略）"
         )
     return expected
 
@@ -159,8 +166,8 @@ def score(args, saved, device, infer_root):
     layout = exogenous_mask_layout(schema)
 
     rows, arrays, masks, symbols = [], [], [], []
-    for symbol, prep in saved["preprocessing"].items():
-        verify_feature_schema(saved, prep)
+    for index, (symbol, prep) in enumerate(saved["preprocessing"].items()):
+        verify_feature_schema(saved, prep, warn_checkpoint=(index == 0))
         path = infer_root / symbol / "latest.npz"
         if not path.exists():
             rows.append({
