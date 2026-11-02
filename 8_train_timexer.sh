@@ -16,8 +16,8 @@
 #   - 每轮只看训练/验证损失做早停，测试集只在最后评估一次，
 #     同时报告零预测 / 训练期均值 / 持续性（昨日收益率）三个基准。
 #
-# 用法：
-#   DATA_DIR=dataset/timexer_run_001/601398 bash 8_train_timexer.sh
+# 用法（统一入口读取导出目录，不再接受单股 --data-dir）：
+#   DATA_DIR=dataset/gseq OUT_DIR=checkpoints/timexer_001 bash 8_train_timexer.sh
 #   # 自定义超参：bash 8_train_timexer.sh --d-model 32 --patch-len 10
 #
 # 输出（$OUT_DIR）：checkpoint.pth、metrics.json、test_predictions.csv
@@ -28,7 +28,8 @@ cd "$(dirname "$0")"
 PYTHON=".venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="python3"
 
-DATA_DIR="${DATA_DIR:-dataset/timexer_run_001/601398}"
+DATA_DIR="${DATA_DIR:-dataset/gseq}"
 OUT_DIR="${OUT_DIR:-checkpoints/stock_timexer_001}"
 
-"$PYTHON" train_timexer.py --data-dir "$DATA_DIR" --out-dir "$OUT_DIR" "$@"
+"$PYTHON" train_stock.py --mode train \
+    --data-root "$DATA_DIR" --out-dir "$OUT_DIR" "$@"
