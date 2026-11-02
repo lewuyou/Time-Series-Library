@@ -158,6 +158,24 @@ import duckdb
 import numpy as np
 import pandas as pd
 
+# 特征列布局（__missing / __age_days / target_dow_* 命名与判定）的
+# 单一事实源在 stock/data/schema.py：本文件（生成侧）与训练/推理侧
+# （解析侧的张量对齐函数）共用同一实现，改特征方案只改那一处。
+from stock.data.schema import (
+    TARGET,
+    TARGET_DOW_NAMES,
+    age_col,
+    dow_column,
+    is_companion_col,
+    is_dow_col,
+    is_exogenous_col,
+    is_missing_col,
+    missing_col,
+)
+# JSON 原子写 / 文件哈希：全仓唯一实现（旧 json_write/sha256_file
+# 本地副本删除，名字保留别名以兼容 ds.json_write 调用方）。
+from stock.utils import sha256_file, write_json
+
 try:
     import torch
     from torch.utils.data import Dataset as _TorchDataset
@@ -185,9 +203,8 @@ COMPATIBLE_VERSIONS = (
 # train_test 用于 walk-forward 两阶段协议的重拟合导出：验证集在测试开始前
 # 已成为历史，可以进入最终训练；测试集不参与任何训练期决策。
 SPLIT_LAYOUTS = ("train_val_test", "train_test")
-TARGET = "stock_return"
-# 目标日星期 one-hot 列名后缀（pandas dayofweek 0=周一 ... 4=周五）。
-TARGET_DOW_NAMES = ("mon", "tue", "wed", "thu", "fri")
+# TARGET / TARGET_DOW_NAMES 改自 stock.data.schema 导入（单一事实源），
+# 值与历史版本一致。
 
 DEFAULT_DB = "../AutoTS/download/autots.duckdb"
 DEFAULT_CALENDAR_START = "2016-01-01"
@@ -222,19 +239,7 @@ def sql_symbol(column):
     )
 
 
-def json_write(path, obj):
-    Path(path).write_text(
-        json.dumps(obj, ensure_ascii=False, indent=2, allow_nan=False),
-        encoding="utf-8",
-    )
-
-
-def sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(block)
-    return h.hexdigest()
+json_write = write_json
 
 
 def parse_dates(df):
@@ -782,10 +787,10 @@ def build_features(prices, calendar, as_of, specs, config):
     base_columns.update(derived)
     new_columns = dict(derived)
     for col in base_columns:
-        new_columns[f"{col}__missing"] = (
+        new_columns[missing_col(col)] = (
             base_columns[col].isna().astype(float)
         )
-        groups[col] = [col, f"{col}__missing"]
+        groups[col] = [col, missing_col(col)]
 
     features = pd.concat(
         [raw, pd.DataFrame(new_columns, index=index)], axis=1
@@ -803,7 +808,7 @@ def build_features(prices, calendar, as_of, specs, config):
     # 恒不缺失，不生成 __missing / __age_days 伴随列，也不参与屏蔽。
     target_dow = next_date.reindex(index).dt.dayofweek
     for i, name in enumerate(TARGET_DOW_NAMES):
-        col = f"target_dow_{name}"
+        col = dow_column(name)
         features[col] = (target_dow == i).astype(float)
         groups[col] = [col]
 
@@ -817,10 +822,10 @@ def build_features(prices, calendar, as_of, specs, config):
         )
         raw_aux[col] = values
         aux_columns[col] = fixed_transform(values, spec["transform"])
-        aux_columns[f"{col}__age_days"] = age
-        aux_columns[f"{col}__missing"] = values.isna().astype(float)
+        aux_columns[age_col(col)] = age
+        aux_columns[missing_col(col)] = values.isna().astype(float)
         groups[col] = [
-            col, f"{col}__age_days", f"{col}__missing"
+            col, age_col(col), missing_col(col)
         ]
         audits.append(part_audit)
 
@@ -980,12 +985,12 @@ def fit_preprocessing(features, samples, groups, min_coverage, min_obs):
         if values.empty:
             raise ValueError(f"保留列 {col} 在训练集全空")
 
-        if col.endswith("__missing"):
+        if is_missing_col(col):
             # 二值标记保持 0/1。
             stats[col] = {"median": 1.0, "mean": 0.0, "scale": 1.0}
             continue
 
-        if col.startswith("target_dow_"):
+        if is_dow_col(col):
             # 目标日星期 one-hot 保持 0/1，不标准化。
             stats[col] = {"median": 0.0, "mean": 0.0, "scale": 1.0}
             continue
@@ -1352,8 +1357,7 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
     # 最新输入行的辅助特征缺失/过期（数据未到或超出 max_age）。
     aux_bases = [
         c for c in features.columns
-        if c.startswith(("baidu_", "val_", "rzrq_", "macro_"))
-        and not c.endswith(("__missing", "__age_days"))
+        if is_exogenous_col(c) and not is_companion_col(c)
     ]
     stale_latest = [
         c for c in aux_bases if not np.isfinite(features[c].iloc[-1])

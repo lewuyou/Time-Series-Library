@@ -1,0 +1,37 @@
+"""适配器基类：定义训练器/推理器依赖的统一接口。"""
+
+import abc
+
+
+class ModelAdapter(abc.ABC):
+    """一个适配器对应 models/ 中的一种模型在股票任务上的接入方式。
+
+    约定：
+    - model_config 产出的 config 同时用于构造模型与登记进 checkpoint
+      （build_model(config) 必须可从 checkpoint 里的 config 复现模型）；
+    - forward 输出 [B, pred_len, 1]，pred_len 当前为 1；
+    - checkpoint_format 用于 predict / predict_daily 反查适配器，
+      格式号一旦发布不可变更语义。
+    """
+
+    #: 适配器名（train_stock.py --model 参数值）
+    name = ""
+    #: checkpoint 登记格式号（"format" 字段）
+    checkpoint_format = ""
+
+    @abc.abstractmethod
+    def model_config(self, args, seq_len, schema):
+        """由 CLI 参数 + 数据 schema 构造模型配置 dict。"""
+
+    @abc.abstractmethod
+    def build_model(self, config):
+        """由 config 构造模型（可从 checkpoint 复现）。"""
+
+    @abc.abstractmethod
+    def forward(self, model, x, ex_mask=None):
+        """标准前向：x [B, L, n_schema] → 预测 [B, 1, 1]。
+
+        ex_mask 为外生 token 有效性掩码（数据集恒产出，是否传入模型
+        由训练协议决定）；不支持掩码的模型应在能力说明中注明并在
+        忽略时显式登记，不得静默假装支持。
+        """
