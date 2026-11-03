@@ -360,6 +360,8 @@ def train_command(a, data_root, out_dir, mode, epochs=None, extra=None):
         "--workers", str(a.loader_workers),
         "--lr", str(a.lr),
         "--weight-decay", str(a.weight_decay),
+        "--loss", a.loss,
+        "--loss-huber-delta", str(a.loss_huber_delta),
         "--seed", str(a.seed),
         "--device", a.device,
     ]
@@ -748,6 +750,15 @@ def parse_args():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument(
+        "--loss", choices=["mse", "huber"], default="mse",
+        help="训练损失：mse（历史默认）或 huber；透传给 "
+             "stock.training.runner，选择/重拟合两阶段一致",
+    )
+    p.add_argument(
+        "--loss-huber-delta", type=float, default=1.0,
+        help="huber 损失的 delta（目标为按股标准化收益率，尺度约 1）",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--device", choices=["auto", "cpu", "cuda"], default="auto",

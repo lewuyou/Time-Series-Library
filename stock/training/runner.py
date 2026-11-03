@@ -116,6 +116,13 @@ def train(args, device):
         "feature_schema_hash": schema_info["hash"],
         # 数据集身份：导出配置字节哈希，便于预测记录回溯到数据口径。
         "dataset_id": sha256_file(Path(args.data_root) / "export_config.json"),
+        # 训练损失登记：checkpoint 可追溯到损失口径（mse/huber）。
+        "loss": {
+            "type": args.loss,
+            "huber_delta": (
+                args.loss_huber_delta if args.loss == "huber" else None
+            ),
+        },
         "target_spec": records[0]["prep"].get("target_spec"),
         # 登记导出任务配置：本折数据截止日、训练起点、训练/验证边界、
         # 脚本与数据哈希，checkpoint 可直接追溯到生成它的数据口径
@@ -140,9 +147,11 @@ def train(args, device):
         train_loss = run_epoch(
             adapter, model, train_loader, device, optimizer=optimizer,
             use_ex_mask=args.ex_mask,
+            loss_type=args.loss, huber_delta=args.loss_huber_delta,
         )
         val_loss = run_epoch(
-            adapter, model, val_loader, device, use_ex_mask=args.ex_mask
+            adapter, model, val_loader, device, use_ex_mask=args.ex_mask,
+            loss_type=args.loss, huber_delta=args.loss_huber_delta,
         )
         history.append({
             "epoch": epoch,
@@ -212,6 +221,11 @@ def train(args, device):
         # train_refit 的一致性检查），避免"选择带掩码、重拟合不带"
         # 的协议漂移。
         "ex_mask": bool(args.ex_mask),
+        # 损失口径登记：两阶段必须一致，选择阶段结果随预算一并传递。
+        "loss": args.loss,
+        "loss_huber_delta": (
+            args.loss_huber_delta if args.loss == "huber" else None
+        ),
         "completed_epochs": len(history),
         "stopped_early": stopped_early,
         "best_epoch": best_epoch,
@@ -306,6 +320,12 @@ def train_refit(args, device):
                 f"refit 的外生掩码协议 --ex-mask={bool(args.ex_mask)} 与"
                 f"选择阶段 ex_mask={selection.get('ex_mask', False)} 不一致"
             )
+        # 损失口径必须前后一致（登记里缺省视为 mse，兼容旧产物）。
+        if selection.get("loss", "mse") != args.loss:
+            raise ValueError(
+                f"refit 的损失 --loss={args.loss} 与选择阶段登记 "
+                f"loss={selection.get('loss', 'mse')} 不一致"
+            )
 
     records, schema = load_catalog(
         args.data_root, expected_layout="train_test"
@@ -396,6 +416,12 @@ def train_refit(args, device):
         "feature_schema": schema_info,
         "feature_schema_hash": schema_info["hash"],
         "dataset_id": sha256_file(Path(args.data_root) / "export_config.json"),
+        "loss": {
+            "type": args.loss,
+            "huber_delta": (
+                args.loss_huber_delta if args.loss == "huber" else None
+            ),
+        },
         "target_spec": records[0]["prep"].get("target_spec"),
         "export_config": spec,
         "preprocessing": {
@@ -423,6 +449,7 @@ def train_refit(args, device):
         train_loss = run_epoch(
             adapter, model, train_loader, device, optimizer=optimizer,
             use_ex_mask=args.ex_mask,
+            loss_type=args.loss, huber_delta=args.loss_huber_delta,
         )
         history.append({
             "epoch": epoch,
@@ -588,6 +615,15 @@ def build_train_parser():
     p.add_argument("--workers", type=int, default=0)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument(
+        "--loss", choices=["mse", "huber"], default="mse",
+        help="训练损失：mse（历史默认）或 huber（对离群收益更稳健）；"
+             "早停按同损失的验证值选择",
+    )
+    p.add_argument(
+        "--loss-huber-delta", type=float, default=1.0,
+        help="huber 损失的 delta（目标为按股标准化收益率，尺度约 1）",
+    )
     p.add_argument("--d-model", type=int, default=64)
     p.add_argument("--e-layers", type=int, default=2)
     p.add_argument("--n-heads", type=int, default=4)
@@ -668,6 +704,8 @@ def main(argv=None):
         args.d_ff is not None and args.d_ff < 1
     ):
         raise ValueError("数量参数不合法")
+    if args.loss_huber_delta <= 0:
+        raise ValueError("--loss-huber-delta 必须 > 0")
 
     random.seed(args.seed)
     np.random.seed(args.seed)

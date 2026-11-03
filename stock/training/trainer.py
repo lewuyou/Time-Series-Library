@@ -8,13 +8,35 @@
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from stock.data.schema import TARGET
 
+LOSS_TYPES = ("mse", "huber")
+
+
+def per_sample_loss(diff, loss_type="mse", huber_delta=1.0):
+    """逐样本损失：输入 (pred - y)，形状 (B, ...)，返回 (B,)。
+
+    mse：逐元素平方后按样本维平均（历史默认口径）。
+    huber：逐元素 Huber（delta 可配）后按样本维平均；目标为按股
+    标准化后的收益率，尺度约 1，delta 默认 1.0。
+    """
+    if loss_type not in LOSS_TYPES:
+        raise ValueError(f"不支持的损失类型：{loss_type}")
+    if loss_type == "huber":
+        element = F.huber_loss(
+            diff, torch.zeros_like(diff), reduction="none",
+            delta=float(huber_delta),
+        )
+    else:
+        element = diff.square()
+    return element.reshape(len(diff), -1).mean(1)
+
 
 def run_epoch(adapter, model, loader, device, optimizer=None,
-              use_ex_mask=False):
+              use_ex_mask=False, loss_type="mse", huber_delta=1.0):
     training = optimizer is not None
     model.train(training)
 
@@ -59,7 +81,9 @@ def run_epoch(adapter, model, loader, device, optimizer=None,
             if pred.shape != y.shape:
                 raise ValueError(f"输出 {pred.shape} != 标签 {y.shape}")
 
-            per_sample = (pred - y).square().reshape(len(x), -1).mean(1)
+            per_sample = per_sample_loss(
+                pred - y, loss_type=loss_type, huber_delta=huber_delta
+            )
             loss = (per_sample * weights[sid]).mean()
             if not torch.isfinite(loss):
                 raise FloatingPointError("loss 为 NaN/Inf")
