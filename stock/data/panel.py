@@ -207,6 +207,13 @@ class PanelWindows(Dataset):
     旗标 token 永不屏蔽（日历列无 __missing 伴随列）。
     """
 
+    # 矩阵文件缓存上限（对照实验选定，见审计报告"替代方案与取舍"）：
+    # 1900 股规模随机窗口访问微基准下，上限 64 命中率约 3%
+    # （0.164ms/读取），512 约 0.130ms/读取（-20%）；512 个文件描述符
+    # 仍远低于默认 ulimit 1024。mmap 页缓存跨进程共享，多 worker
+    # 不会成倍占用物理内存。
+    _matrix_cache_limit = 512
+
     def __init__(self, records, schema, split, layout="train_val_test",
                  allow_missing=False, calendar_mode="time_marks"):
         if layout not in ("train_val_test", "train_test"):
@@ -390,7 +397,7 @@ class PanelWindows(Dataset):
             path = Path(self.records[sid]["root"]) / "feature_matrix.npy"
             self.cache[sid] = np.load(path, mmap_mode="r")
             # 防止几千个股票矩阵长期同时占用文件描述符。
-            if len(self.cache) > 64:
+            if len(self.cache) > self._matrix_cache_limit:
                 self.cache.popitem(last=False)
         self.cache.move_to_end(sid)
         return self.cache[sid]
