@@ -16,12 +16,11 @@ cd /root/projects/Time-Series-Library
 
 ### 0.2 拆分后的入口
 
-根目录只保留三个 Python 入口（其余老脚本已在 `a944176` 删除）：
+根目录只保留两个 Python 入口（其余老脚本已在 `a944176` 删除；`analyze_daily_hit.py` 薄转发入口也已在后续清理中删除，替代命令见第 4 节）：
 
 | 入口 | 作用 |
 | --- | --- |
 | `dataset.py` | 单股数据引擎：`prepare` / `infer` / `validate` |
-| `analyze_daily_hit.py` | 历史逐日命中分析（保留，未迁走） |
 | `run.py` | 官方框架入口（与本股票流程无关） |
 
 股票流程的四个主入口全部是模块：
@@ -470,7 +469,7 @@ PY
 - 成功判据：终端打印 `回填 N 条（标签文件 M 条）` 及 `coverage / signal_hit_rate / base_up_rate / signal_excess_hit` 等指标，退出码 0
 - 已实测：1 条预测 / 1 条标签，`coverage=1.0`，报告正常输出
 
-> 老入口：`analyze_daily_hit.py` 仍保留（逐日命中分析）；批量样本外评估用 `python -m stock.evaluation.walk_forward`（CLI 已通过 `--help`，完整调度未在本手册实跑）。
+> 老入口：`analyze_daily_hit.py` 已删除；逐日命中分析用 `python -m stock.evaluation.daily_hit --run-dir <ckpt目录>`（`--help` 已通过）。批量样本外评估用 `python -m stock.evaluation.walk_forward`（CLI 已通过 `--help`，完整调度未在本手册实跑）。
 
 ---
 
@@ -541,6 +540,6 @@ PY
 | 4.3 库 run → CSV → `backtest` | 实跑通过 |
 | 4.4 `outcome_evaluator` | 实跑通过 |
 | `stock.evaluation.walk_forward` | `--help` 通过；完整折调度未实跑 |
-| `stock.evaluation.daily_hit` / `analyze_daily_hit.py` | `--help` 通过；未在本轮实跑 |
+| `stock.evaluation.daily_hit`（原 `analyze_daily_hit.py`，已删） | `--help` 通过；未在本轮实跑 |
 | `--skip-export` | 未验证 |
 | `prediction_outcomes` JOIN 取 `y_true` | 未验证 |
