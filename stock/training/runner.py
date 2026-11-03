@@ -50,10 +50,15 @@ def train(args, device):
     records, schema = load_catalog(
         args.data_root, expected_layout="train_val_test"
     )
-    train_ds = PanelWindows(records, schema, "train")
+    train_ds = PanelWindows(
+        records, schema, "train", calendar_mode=args.calendar_mode
+    )
     # 单股验证覆盖不足（停牌/缺数）只影响该股早停贡献，不影响训练资格；
     # 整体验证集为空则无证据选预算，必须报错。
-    val_ds = PanelWindows(records, schema, "val", allow_missing=True)
+    val_ds = PanelWindows(
+        records, schema, "val", allow_missing=True,
+        calendar_mode=args.calendar_mode,
+    )
     if len(val_ds) == 0:
         raise ValueError(
             "整体验证集没有任何可评分样本，无法早停选预算"
@@ -88,12 +93,20 @@ def train(args, device):
         f"stocks={len(records)}, features={len(schema)}, "
         f"train={len(train_ds)}, val={len(val_ds)}, device={device}"
     )
+    print(
+        f"[INFO] calendar_mode={config.get('calendar_mode', 'time_marks')} "
+        f"calendar_columns={len(config.get('calendar_columns', []))} "
+        f"mark_dim={config.get('calendar_mark_dim', 0)} "
+        f"head_calendar_dim={config.get('head_calendar_dim', 0)}",
+        flush=True,
+    )
 
     spec = read_json(Path(args.data_root) / "export_config.json")
     schema_info = feature_schema_doc(schema)
 
     metadata = {
-        "format": adapter.checkpoint_format,
+        # 格式号随 model_config 变化（如预测头日历向量开启时为 v2）。
+        "format": adapter.checkpoint_format_for(config),
         "model": adapter.name,
         "model_config": config,
         "schema": schema,
@@ -232,7 +245,10 @@ def train(args, device):
     )
     model.load_state_dict(saved["state_dict"])
 
-    test_ds = PanelWindows(records, schema, "test", allow_missing=True)
+    test_ds = PanelWindows(
+        records, schema, "test", allow_missing=True,
+        calendar_mode=args.calendar_mode,
+    )
     if len(test_ds) == 0:
         raise ValueError("整体测试集没有任何可评分样本")
     test_loader = DataLoader(
@@ -294,7 +310,10 @@ def train_refit(args, device):
     records, schema = load_catalog(
         args.data_root, expected_layout="train_test"
     )
-    train_ds = PanelWindows(records, schema, "train", layout="train_test")
+    train_ds = PanelWindows(
+        records, schema, "train", layout="train_test",
+        calendar_mode=args.calendar_mode,
+    )
     if len(train_ds) == 0:
         raise ValueError("重拟合训练集为空")
 
@@ -360,9 +379,17 @@ def train_refit(args, device):
         f"train={len(train_ds)}, budget_epochs={args.epochs}, "
         f"device={device}"
     )
+    print(
+        f"[REFIT] calendar_mode={config.get('calendar_mode', 'time_marks')} "
+        f"calendar_columns={len(config.get('calendar_columns', []))} "
+        f"mark_dim={config.get('calendar_mark_dim', 0)} "
+        f"head_calendar_dim={config.get('head_calendar_dim', 0)}",
+        flush=True,
+    )
 
     metadata = {
-        "format": adapter.checkpoint_format,
+        # 格式号随 model_config 变化（如预测头日历向量开启时为 v2）。
+        "format": adapter.checkpoint_format_for(config),
         "model": adapter.name,
         "model_config": config,
         "schema": schema,
@@ -439,7 +466,8 @@ def train_refit(args, device):
     # fit_metadata；此时 walk-forward 汇总不适用（本模式不产生
     # test_predictions.csv）。
     test_ds = PanelWindows(
-        records, schema, "test", layout="train_test", allow_missing=True
+        records, schema, "test", layout="train_test", allow_missing=True,
+        calendar_mode=args.calendar_mode,
     )
     summary = None
     if len(test_ds) > 0:
@@ -588,6 +616,25 @@ def build_train_parser():
              "掩码，本开关仅控制是否传入模型。启用后登记进 "
              "checkpoint，predict / predict_daily 自动跟随；建议按"
              "预先规定的消融实验（开 vs 关）对比后再采用",
+    )
+    p.add_argument(
+        "--calendar-mode",
+        choices=["time_marks", "columns", "none"],
+        default="time_marks",
+        help="目标日日历列喂入方式：time_marks（默认，官方通道）= 3 个"
+             "时间标记列移入 x_mark（旗标列仍留在输入列）；columns = 全部"
+             "日历列随其他特征进输入列；none = 关闭全部日历信息（A/B 基线）。"
+             "登记进 checkpoint，推理端按 checkpoint 复现，"
+             "不接受命令行覆盖（TimeXer 专属；TimesNet 仅支持 columns）",
+    )
+    p.add_argument(
+        "--head-calendar",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="预测头 Flatten 前拼接目标日星期 one-hot（5 维，默认开启；"
+             "--no-head-calendar 关闭，关闭时模型与上游 TimeXer 数值等价）。"
+             "与 x_mark 的 DayOfWeek 标记存在有意的信息重叠（见 "
+             "CALENDAR_DESIGN.md）；开启后 checkpoint 用 v2 格式号；"
+             "TimeXer 专属，TimesNet 必须 --no-head-calendar",
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")

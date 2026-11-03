@@ -13,6 +13,10 @@ def _args(**overrides):
     base = dict(
         d_model=8, e_layers=1, n_heads=2, patch_len=5,
         dropout=0.1, ex_mask=False,
+        # 日历协议开关（P6）：TimeXer 默认 time_marks；契约测试里
+        # head 默认关闭，保持既有的"裸 forward 无需 head_calendar"契约；
+        # head 开启协议见 test_timexer_head_calendar_protocol。
+        calendar_mode="time_marks", head_calendar=False,
         # TimesNet 专属（TimeXer 适配器不读取，多给无害）
         d_ff=None, top_k=5, num_kernels=6, use_norm=False,
     )
@@ -77,9 +81,40 @@ def test_adapter_validates_model_specific_args_early():
         adapter.validate_args(_args(patch_len=4), 10)
     with pytest.raises(ValueError, match="整除|n-heads"):
         adapter.validate_args(_args(d_model=7, n_heads=2), 10)
+    with pytest.raises(ValueError, match="calendar_mode"):
+        adapter.validate_args(_args(calendar_mode="both"), 10)
     adapter.validate_args(_args(), 10)
     assert "d_model" in adapter.cli_params
+    assert "calendar_mode" in adapter.cli_params
+    assert "head_calendar" in adapter.cli_params
     assert "batch_size" not in adapter.cli_params
+
+
+def test_timexer_head_calendar_protocol():
+    """head_calendar 开启（默认生产行为）：格式 v2、forward 契约、参数量。"""
+    adapter = get_adapter("TimeXer")
+    cfg = adapter.model_config(_args(head_calendar=True), 10, _schema())
+    assert cfg["head_calendar_dim"] == 5
+    assert cfg["calendar_mode"] == "time_marks"
+    assert adapter.checkpoint_format_for(cfg) == "global_timexer_typed_v2"
+    model = adapter.build_model(cfg)
+    x = torch.randn(2, 10, len(_schema()))
+    # head 开启时缺 head_calendar 必须显式报错
+    with pytest.raises(ValueError, match="head_calendar"):
+        adapter.forward(model, x)
+    head = torch.zeros(2, 5)
+    head[:, 1] = 1.0
+    with torch.no_grad():
+        y = adapter.forward(model, x, head_calendar=head)
+    assert y.shape == (2, 1, 1) and torch.isfinite(y).all()
+    # 与同配置 head 关闭的参数量差 = 5（head Linear 多 5 个输入权重）
+    cfg_off = dict(cfg, head_calendar_dim=0)
+    model_off = adapter.build_model(cfg_off)
+    assert adapter.checkpoint_format_for(cfg_off) == "global_timexer_typed_v1"
+    diff = sum(p.numel() for p in model.parameters()) - sum(
+        p.numel() for p in model_off.parameters()
+    )
+    assert diff == 5
 
 
 # ---------- 双模型通用契约（新增模型时把名字加进参数表） ----------
@@ -149,17 +184,24 @@ def test_timesnet_semantics_documented_in_config():
 
 def test_timesnet_validates_fft_band_and_rejects_ex_mask():
     adapter = get_adapter("TimesNet")
+    # TimesNet 只支持 columns 日历模式（time_marks 是 TimeXer 专属通道）
+    cols = dict(calendar_mode="columns")
     # seq_len=10 → 可用频段 (10+1)//2=5；top_k=6 必然选中 0 频除零
     with pytest.raises(ValueError, match="频段"):
-        adapter.validate_args(_args(top_k=6), 10)
-    adapter.validate_args(_args(top_k=5), 10)
+        adapter.validate_args(_args(top_k=6, **cols), 10)
+    adapter.validate_args(_args(top_k=5, **cols), 10)
     with pytest.raises(ValueError, match="正数"):
-        adapter.validate_args(_args(top_k=0), 10)
+        adapter.validate_args(_args(top_k=0, **cols), 10)
     with pytest.raises(ValueError, match="正数"):
-        adapter.validate_args(_args(num_kernels=0), 10)
+        adapter.validate_args(_args(num_kernels=0, **cols), 10)
     # ex_mask 协议显式拒绝，不静默退化
     with pytest.raises(ValueError, match="ex-mask"):
-        adapter.validate_args(_args(ex_mask=True), 10)
+        adapter.validate_args(_args(ex_mask=True, **cols), 10)
+    # time_marks / head_calendar 显式拒绝
+    with pytest.raises(ValueError, match="columns"):
+        adapter.validate_args(_args(calendar_mode="time_marks"), 10)
+    with pytest.raises(ValueError, match="head-calendar"):
+        adapter.validate_args(_args(head_calendar=True, **cols), 10)
 
 
 def test_timesnet_forward_rejects_non_null_mask_defensively():

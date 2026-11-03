@@ -62,6 +62,20 @@ class TimesNetAdapter(ModelAdapter):
                 "token 结构，缺失信息只能靠 __missing 标记通道本身"
                 "参与训练）；请勿对 TimesNet 开启该开关"
             )
+        # 未显式给出 calendar_mode（如直接构造的 Namespace）按 columns
+        # 处理；runner 默认 time_marks 是 TimeXer 官方通道，TimesNet
+        # 必须显式 --calendar-mode columns。
+        mode = getattr(args, "calendar_mode", None) or "columns"
+        if mode != "columns":
+            raise ValueError(
+                f"TimesNet 只支持 calendar_mode=columns（日历列作为输入"
+                f"通道），不支持 {mode}；time_marks 是 TimeXer 专属通道，"
+                "请显式传 --calendar-mode columns"
+            )
+        if bool(getattr(args, "head_calendar", False)):
+            raise ValueError(
+                "TimesNet 不支持预测头日历拼接，请加 --no-head-calendar"
+            )
         top_k = getattr(args, "top_k", 5)
         num_kernels = getattr(args, "num_kernels", 6)
         d_ff = getattr(args, "d_ff", None)
@@ -108,12 +122,22 @@ class TimesNetAdapter(ModelAdapter):
     def build_model(self, config):
         return TimesNet(argparse.Namespace(**config)).float()
 
-    def forward(self, model, x, ex_mask=None):
+    def forward(self, model, x, ex_mask=None, x_mark=None,
+                head_calendar=None):
         if ex_mask is not None:
             raise ValueError(
                 "TimesNet 不支持 ex_mask（训练时 --ex-mask 已在 "
                 "validate_args 拒绝；checkpoint 协议也不会登记掩码）"
             )
+        if x_mark is not None:
+            raise ValueError(
+                "TimesNet 不支持 x_mark 时间标记通道（训练时非 columns 的 "
+                "calendar_mode 已在 validate_args 拒绝）"
+            )
+        # head_calendar 由数据集恒产出、训练器恒透传；TimesNet 从不启用
+        # 预测头日历拼接（--head-calendar 已在 validate_args 拒绝），
+        # 此处显式忽略，不得参与计算。
+        del head_calendar
         out = model(x, None, None, None)
         # use_norm=1 时反归一化广播会把输出扩成 [B, 1, C]；目标固定
         # 为 schema 末列，切末列统一成 [B, 1, 1]（use_norm=0 时无操作）。

@@ -169,6 +169,10 @@ from stock.utils import date_text
 # stock/evaluation/walk_forward.py -> 仓库根（子进程用 -m 调用 stock.* 模块）
 SCRIPT_DIR = Path(__file__).resolve().parents[2]
 
+# runner 侧的 BooleanOptionalAction 参数：值为 False 时必须显式传
+# --no-*（不能省略，否则会落到 runner 的默认值）。
+_BOOLOPT_PARAMS = {"head_calendar"}
+
 
 def read_db_state(con, calendar):
     """数据库快照指纹：最新行情日 + 截至该日的交易日历哈希。
@@ -326,6 +330,10 @@ def export_command(a, db, universe, data_root, fold, layout,
     if train_start is not None:
         command += ["--train-start", train_start]
 
+    # 日历列集合是导出规格的一部分：缺省（all）不透传，保持旧命令兼容。
+    if getattr(a, "calendar_features", None) is not None:
+        command += ["--calendar-features", a.calendar_features]
+
     return command
 
 
@@ -358,6 +366,9 @@ def train_command(a, data_root, out_dir, mode, epochs=None, extra=None):
         if isinstance(value, bool):
             if value:
                 command.append(flag)
+            elif name in _BOOLOPT_PARAMS:
+                # BooleanOptionalAction 参数：显式传 --no-* 覆盖默认值。
+                command.append("--no-" + name.replace("_", "-"))
         else:
             command += [flag, str(value)]
     if epochs is not None:
@@ -620,6 +631,25 @@ def parse_args():
              "stock.training.runner --ex-mask，选择/重拟合两阶段一致；"
              "默认关闭＝维持既有\"填补＋缺失标记\"协议，建议以消融"
              "实验对比后再采用）",
+    )
+    p.add_argument(
+        "--calendar-features", default=None,
+        help="启用的目标日日历列（3 个时间标记列 + 5 个旗标列；"
+             "all/none/逗号列表）；缺省 all，透传给 stock.data.export "
+             "--calendar-features。不同集合构成不同导出规格，各折 "
+             "data-root 相互独立",
+    )
+    p.add_argument(
+        "--calendar-mode", default=None,
+        help="TimeXer 日历列喂入方式（time_marks/columns/none）；"
+             "缺省 time_marks（官方通道），透传给 stock.training.runner "
+             "--calendar-mode（TimesNet 仅支持 columns）",
+    )
+    p.add_argument(
+        "--head-calendar",
+        action=argparse.BooleanOptionalAction, default=None,
+        help="TimeXer 预测头拼接目标日星期 one-hot；缺省不透传（= "
+             "runner 默认开启），--no-head-calendar 显式关闭并透传",
     )
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--dropout", type=float, default=0.1)

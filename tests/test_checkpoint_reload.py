@@ -17,6 +17,8 @@ def _adapter_and_config(model_name="TimeXer"):
     args = argparse.Namespace(
         d_model=8, e_layers=1, n_heads=2, patch_len=5,
         dropout=0.1, ex_mask=False,
+        # 日历协议（P6）：本文件主 roundtrip 保持 v1（head 关闭）
+        calendar_mode="time_marks", head_calendar=False,
         d_ff=None, top_k=5, num_kernels=6, use_norm=False,
     )
     schema = ["px_close_ret", "px_volume_log", "stock_return"]
@@ -70,6 +72,42 @@ def test_checkpoint_roundtrip_preserves_output(model_name):
     loaded.eval()
     with torch.no_grad():
         after = loaded_adapter.forward(loaded, x)
+    assert torch.allclose(before, after, atol=0, rtol=0)
+    path.unlink()
+
+
+def test_checkpoint_roundtrip_v2_head_calendar():
+    """head 开启（生产默认）走 v2 格式号：反查适配器并保输出一致。"""
+    adapter = get_adapter("TimeXer")
+    args = argparse.Namespace(
+        d_model=8, e_layers=1, n_heads=2, patch_len=5,
+        dropout=0.1, ex_mask=False,
+        calendar_mode="time_marks", head_calendar=True,
+    )
+    schema = ["px_close_ret", "px_volume_log", "stock_return"]
+    config = adapter.model_config(args, 10, schema)
+    fmt = adapter.checkpoint_format_for(config)
+    assert fmt == "global_timexer_typed_v2"
+
+    model = adapter.build_model(config)
+    model.eval()
+    x = torch.randn(2, 10, len(schema))
+    head = torch.zeros(2, 5)
+    head[:, 3] = 1.0
+    with torch.no_grad():
+        before = adapter.forward(model, x, head_calendar=head)
+
+    path = Path("/tmp/tsl_test_checkpoint_v2.pth")
+    torch.save({"metadata": {"format": fmt},
+                "state_dict": model.state_dict()}, path)
+    saved = torch.load(path, map_location="cpu", weights_only=False)
+    loaded_adapter = adapter_for_checkpoint(saved["metadata"]["format"])
+    assert loaded_adapter.name == "TimeXer"
+    loaded = loaded_adapter.build_model(config)
+    loaded.load_state_dict(saved["state_dict"])
+    loaded.eval()
+    with torch.no_grad():
+        after = loaded_adapter.forward(loaded, x, head_calendar=head)
     assert torch.allclose(before, after, atol=0, rtol=0)
     path.unlink()
 

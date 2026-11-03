@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from stock.data.schema import TARGET, is_dow_col, is_missing_col
+from stock.data.schema import TARGET, is_calendar_col, is_missing_col
 
 def fit_preprocessing(features, samples, groups, min_coverage, min_obs):
     # 只用合法训练样本（label_valid）拟合：无标签的"可预测"行不参与
@@ -28,6 +28,13 @@ def fit_preprocessing(features, samples, groups, min_coverage, min_obs):
         series = fit[base]
         cov = float(series.notna().mean())
         coverage[base] = cov
+
+        if is_calendar_col(base):
+            # 日历列永远完全已知（恒不缺失），且装载侧禁止对日历列
+            # 补零对齐（会把 0 误当成语义值），故不参与覆盖率/常数
+            # 丢弃，始终保留（实践中日历列在训练期内均非常数）。
+            keep.extend(columns)
+            continue
 
         if cov < min_coverage or series.notna().sum() < min_obs:
             dropped[base] = "low_train_coverage_or_observations"
@@ -54,8 +61,9 @@ def fit_preprocessing(features, samples, groups, min_coverage, min_obs):
             stats[col] = {"median": 1.0, "mean": 0.0, "scale": 1.0}
             continue
 
-        if is_dow_col(col):
-            # 目标日星期 one-hot 保持 0/1，不标准化。
+        if is_calendar_col(col):
+            # 目标日日历列（时间标记列与旗标列）保持原值，不参与
+            # 标准化（日历信息永远完全已知，取值本身已归一/为 0/1）。
             stats[col] = {"median": 0.0, "mean": 0.0, "scale": 1.0}
             continue
 

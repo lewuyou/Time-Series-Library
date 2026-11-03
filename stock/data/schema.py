@@ -1,17 +1,17 @@
 """特征列布局的单一事实源（生成侧 + 解析侧共用）。
 
-原先 dataset.py（生成侧：`__missing` / `__age_days` / `target_dow_*`）
+原先 dataset.py（生成侧：`__missing` / `__age_days` / 目标日日历列）
 与 train_global_timexer.py（解析侧：base_name / align_features /
 exogenous_mask_layout / compute_ex_mask）各写一份布局规则，改特征方案
 需要同步两处，漏改一处即静默错位。现统一收敛到本模块：
 
 - 生成侧（dataset.py 生成特征矩阵）：引用命名常量与
-  missing_col / age_col / dow_column / is_* 判定；
+  missing_col / age_col / is_* 判定；
 - 解析侧（stock.data.panel / stock.adapters / stock.inference）：
   引用 base_name / align_features / exogenous_mask_layout /
   compute_ex_mask / DROP_BASES。
 
-改特征布局（增删伴随列、目标日星期、外生来源前缀、价格基础列
+改特征布局（增删伴随列、目标日日历列、外生来源前缀、价格基础列
 剔除范围）只改本文件。本模块保持纯 Python（仅依赖 numpy 的
 张量对齐函数除外），供 dataset.py 安全引用。
 """
@@ -24,15 +24,46 @@ import numpy as np
 TARGET = "stock_return"
 
 #: 特征列布局版本。列名/顺序/分组语义变化时递增；写入导出目录与
-#: checkpoint，推理契约不匹配即报错（旧产物缺字段时显式告警）。
-FEATURE_SCHEMA_VERSION = "stock_features_v1"
+#: checkpoint，推理契约不匹配即报错。
+#: v3：删除 target_dow_* one-hot（星期信息改由 x_mark 时间标记通道
+#: 与预测头 one-hot 承载，不做双份编码）；新增 3 个官方归一化时间
+#: 特征列（target_mark_dow/dom/doy）+ 5 个交易日历旗标列，全部按
+#: 目标日（下一交易日）取值。
+FEATURE_SCHEMA_VERSION = "stock_features_v3"
 
 
-# 伴随列后缀与目标日星期前缀（pandas dayofweek 0=周一 ... 4=周五）。
+# 伴随列后缀。
 MISSING_SUFFIX = "__missing"
 AGE_SUFFIX = "__age_days"
-DOW_PREFIX = "target_dow_"
-TARGET_DOW_NAMES = ("mon", "tue", "wed", "thu", "fri")
+
+# 目标日时间标记列（官方 TimeXer 日频三特征，归一化写法与
+# utils/timefeatures.py 的 DayOfWeek/DayOfMonth/DayOfYear 一致；
+# 行 t 存"预测目标交易日 = t 的下一交易日"的取值）。默认经
+# calendar_mode=time_marks 移入 x_mark 通道（官方通道），也可按
+# calendar_mode=columns 留在输入列。
+TARGET_MARK_DOW = "target_mark_dow"
+TARGET_MARK_DOM = "target_mark_dom"
+TARGET_MARK_DOY = "target_mark_doy"
+
+#: 时间标记列（规范顺序 = 官方 time_features_from_frequency_str("d")）。
+TARGET_MARK_NAMES = (TARGET_MARK_DOW, TARGET_MARK_DOM, TARGET_MARK_DOY)
+
+# 目标日日历旗标列（语义见 stock.data.features.target_calendar_features：
+# 行 t 存"预测目标交易日 = t 的下一交易日"的属性，纯交易日历推导）。
+TARGET_GAP_DAYS_LOG = "target_gap_days_log"
+TARGET_IS_GAP_GE4 = "target_is_gap_ge4"
+TARGET_IS_PRE_LONG_HOLIDAY = "target_is_pre_long_holiday"
+TARGET_IS_MONTH_START_3 = "target_is_month_start_3"
+TARGET_IS_MONTH_END_3 = "target_is_month_end_3"
+
+#: 日历旗标列（x_mark 装不下、有独立信息量，恒为普通外生列）。
+TARGET_CALENDAR_EXTRA_NAMES = (
+    TARGET_GAP_DAYS_LOG,
+    TARGET_IS_GAP_GE4,
+    TARGET_IS_PRE_LONG_HOLIDAY,
+    TARGET_IS_MONTH_START_3,
+    TARGET_IS_MONTH_END_3,
+)
 
 # 外生（辅助）来源前缀：dataset.py 按此前缀对齐可用时间并生成伴随列。
 EXOGENEOUS_SOURCES = ("baidu", "val", "rzrq", "macro")
@@ -54,14 +85,32 @@ def age_col(base):
     return f"{base}{AGE_SUFFIX}"
 
 
-def dow_column(name):
-    """目标日星期 one-hot 列名，name ∈ TARGET_DOW_NAMES。"""
-    return f"{DOW_PREFIX}{name}"
+def target_calendar_columns():
+    """全部目标日日历列（时间标记列 + 旗标列，规范顺序）。"""
+    return list(TARGET_MARK_NAMES) + list(TARGET_CALENDAR_EXTRA_NAMES)
 
 
-def dow_columns():
-    """全部目标日星期 one-hot 列名（周一~周五顺序）。"""
-    return [dow_column(name) for name in TARGET_DOW_NAMES]
+def parse_calendar_features(spec):
+    """日历列集合配置 -> 启用列名列表（规范顺序）。
+
+    spec: "all"（默认，3 个时间标记列 + 5 个旗标列）/ "none"（全部
+    关闭）/ 逗号分隔列名列表（子集，用于 A/B）。
+    """
+    if spec is None:
+        spec = "all"
+    text = str(spec).strip()
+    known = target_calendar_columns()
+    if text == "all":
+        return list(known)
+    if text == "none":
+        return []
+    names = [part.strip() for part in text.split(",") if part.strip()]
+    unknown = [n for n in names if n not in known]
+    if unknown:
+        raise ValueError(
+            f"未知日历特征列：{unknown}；可选：{known}"
+        )
+    return [c for c in known if c in set(names)]
 
 
 def is_missing_col(name):
@@ -72,8 +121,18 @@ def is_age_col(name):
     return name.endswith(AGE_SUFFIX)
 
 
-def is_dow_col(name):
-    return name.startswith(DOW_PREFIX)
+def is_mark_col(name):
+    """目标日时间标记列（官方日频三特征；time_marks 模式移入 x_mark）。"""
+    return name in TARGET_MARK_NAMES
+
+
+def is_calendar_col(name):
+    """目标日日历列（时间标记列与旗标列共用 target_ 前缀）。
+
+    这些列永远已知（无 __missing 伴随列）、不参与标准化与屏蔽；
+    装载/训练侧按此判定拆分日历通道（见 stock.data.panel）。
+    """
+    return name.startswith("target_")
 
 
 def is_companion_col(name):
@@ -148,7 +207,7 @@ def feature_group(column):
     """特征列的分组标签（仅用于审计与可视化，不参与计算）。"""
     if column == TARGET:
         return "target"
-    if is_dow_col(column):
+    if is_calendar_col(column):
         return "calendar"
     if is_missing_col(column):
         return "missing_flag"
@@ -176,10 +235,14 @@ def feature_schema(schema):
     return columns
 
 
-def feature_schema_hash(columns):
-    """稳定 hash：只依赖版本与列描述，不依赖 dict 插入顺序。"""
+def feature_schema_hash(columns, version=None):
+    """稳定 hash：只依赖版本与列描述，不依赖 dict 插入顺序。
+
+    version 缺省为当前版本常量；校验旧产物时传入其存储版本重算，
+    使版本升级（新增列）不会把旧导出目录/旧 checkpoint 判为不匹配。
+    """
     payload = {
-        "version": FEATURE_SCHEMA_VERSION,
+        "version": FEATURE_SCHEMA_VERSION if version is None else version,
         "columns": columns,
     }
     text = json.dumps(

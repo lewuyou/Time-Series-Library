@@ -18,6 +18,9 @@ from stock.data.schema import (
     base_name,
     compute_ex_mask,
     exogenous_mask_layout,
+    is_calendar_col,
+    is_mark_col,
+    target_calendar_columns,
 )
 from stock.utils import read_json
 
@@ -143,6 +146,19 @@ def load_catalog(data_root, expected_layout=None):
             "train_mean": float(train_y.mean()),
         })
 
+    # 日历特征列集合必须全股票一致（同一导出规格）。禁止不同日历规格
+    # 的导出目录混用，也禁止用补零对齐日历列（会把 0 误当成语义值，
+    # 例如把 dow=0 当成周一）；不一致即显式报错，要求换新 data-root 重导。
+    calendar_sets = {
+        tuple(c for c in r["columns"] if is_calendar_col(c))
+        for r in records
+    }
+    if len(calendar_sets) > 1:
+        raise ValueError(
+            "各股票日历特征列集合不一致（禁止混用不同日历规格的导出目录，"
+            "也不得补零对齐日历列）；请使用同一导出规格的新 data-root 重导"
+        )
+
     # 仅依据导出时在训练期保留的列生成 schema。
     exogenous = sorted({
         c
@@ -153,7 +169,15 @@ def load_catalog(data_root, expected_layout=None):
     if not exogenous:
         raise ValueError("没有可用外生变量")
 
-    return records, exogenous + [TARGET]
+    # 日历列固定排在外生列末尾（紧邻 TARGET），且按 target_calendar_columns()
+    # 的规范顺序（时间标记列在前、旗标列在后）：calendar_mode 的 x_mark
+    # 拆分与 ex_mask 重排都依赖这一顺序（见 stock/adapters/timexer.py
+    # 与 CALENDAR_DESIGN.md）。
+    value_cols = [c for c in exogenous if not is_calendar_col(c)]
+    cal_set = {c for c in exogenous if is_calendar_col(c)}
+    calendar_cols = [c for c in target_calendar_columns() if c in cal_set]
+    calendar_cols += sorted(cal_set - set(calendar_cols))
+    return records, value_cols + calendar_cols + [TARGET]
 
 
 class PanelWindows(Dataset):
@@ -165,29 +189,77 @@ class PanelWindows(Dataset):
       train_test：target <= train_end（重拟合截止日 fit_end）为 train，
         其余为 test，没有 val。
     样本只装载 label_valid=True 的行（可评分样本；无标签行是覆盖登记）。
-    __getitem__ 返回 (x, y, sid, target, y_raw, ex_mask)：y 为标准化
-    float32 标签（训练/验证损失用），y_raw 为 float64 原始标签（评估
-    真值直接取用）。
+    __getitem__ 返回 (x, y, sid, target, y_raw, ex_mask, x_mark, head_cal)：
+    y 为标准化 float32 标签（训练/验证损失用），y_raw 为 float64 原始
+    标签（评估真值直接取用），x_mark 为时间标记通道（可能为 0 列），
+    head_cal 为目标日星期 one-hot（float32 (5,)，供预测头日历拼接；
+    由目标日期直接推导，与日历列开关无关）。
     allow_missing：允许个别股票在本 split 全程无有效样本（停牌等；
     覆盖率不决定训练资格），装载时跳过，该股票不参与该 split；
     其余情况样本缺失视为导出/装载错配，直接报错。
+
+    calendar_mode（目标日日历列的喂入方式，训练/推理必须一致）：
+      time_marks（默认，官方通道）：3 个时间标记列（target_mark_*）
+        从 x 移入 x_mark，5 个旗标列仍留在 x；
+      columns：全部日历列随其他特征留在 x 中，不使用 x_mark；
+      none：日历列全部移除（关闭全部日历信息，A/B 基线）。
+    ex_mask 的长度恒等于 x 中外生 token 数；时间标记 token 与日历
+    旗标 token 永不屏蔽（日历列无 __missing 伴随列）。
     """
 
     def __init__(self, records, schema, split, layout="train_val_test",
-                 allow_missing=False):
+                 allow_missing=False, calendar_mode="time_marks"):
         if layout not in ("train_val_test", "train_test"):
             raise ValueError(f"不支持的 split_layout：{layout}")
         if layout == "train_test" and split == "val":
             raise ValueError("train_test 布局没有 val 样本")
+        if calendar_mode not in ("time_marks", "columns", "none"):
+            raise ValueError(f"不支持的 calendar_mode：{calendar_mode}")
 
         self.records = records
         self.schema = schema
         self.split = split
         self.layout = layout
+        self.calendar_mode = calendar_mode
         self.parts = []
         self.record_ids = []
         self.cache = OrderedDict()
         self.seq_len = records[0]["prep"]["config"]["seq_len"]
+
+        # 日历通道拆分位置（依赖 load_catalog 的"日历列排在外生列末尾"
+        # 顺序；此处仍按名字显式定位，避免隐式假设）。
+        ex_columns = schema[:-1]
+        mark_pos = [i for i, c in enumerate(ex_columns) if is_mark_col(c)]
+        cal_pos = [i for i, c in enumerate(ex_columns) if is_calendar_col(c)]
+        self.mark_pos = np.asarray(mark_pos, dtype=np.int64)
+        self.cal_pos = np.asarray(cal_pos, dtype=np.int64)
+        if calendar_mode == "time_marks":
+            drop = set(mark_pos)
+        elif calendar_mode == "none":
+            drop = set(cal_pos)
+        else:  # columns
+            drop = set()
+        self.keep_pos = np.asarray(
+            [i for i in range(len(schema)) if i not in drop],
+            dtype=np.int64,
+        )
+        # ex_mask 覆盖 x 中的外生 token（不含 TARGET），顺序与 x 一致：
+        # 在全 schema 掩码上按 keep 的外生位置重排即可。
+        self.ex_mask_order = np.asarray(
+            [i for i in self.keep_pos if i < len(schema) - 1],
+            dtype=np.int64,
+        )
+        # 目标日星期 one-hot（预测头日历向量来源）：交易日必为周一~周五。
+        self.head_onehot = []
+        for r in records:
+            dow = pd.DatetimeIndex(r["dates"]).dayofweek
+            if (dow > 4).any():
+                raise ValueError(
+                    f"{r['symbol']}: 交易日历包含周末日期，无法构造星期 one-hot"
+                )
+            onehot = np.zeros((len(dow), 5), dtype=np.float32)
+            onehot[np.arange(len(dow)), dow] = 1.0
+            self.head_onehot.append(onehot)
 
         counts = []
         for record_id, r in enumerate(records):
@@ -333,18 +405,44 @@ class PanelWindows(Dataset):
         start, end, target = positions[local]
         raw = self.matrix(sid)[start:end + 1]
 
-        x = np.zeros(
+        x_full = np.zeros(
             (self.seq_len, len(self.schema)), dtype=np.float32
         )
-        x[:, self.missing] = 1.0
+        x_full[:, self.missing] = 1.0
         dst, src = self.maps[sid]
-        x[:, dst] = raw[:, src]
+        x_full[:, dst] = raw[:, src]
 
-        # 外生 token 有效性掩码（见 compute_ex_mask）：第 6 个元素。
-        # 只标记"窗口内整段无观测"的外生值列；缺失标记 / 年龄列不屏蔽。
-        ex_mask = compute_ex_mask(x, self.ex_mask_layout)
+        # 外生 token 有效性掩码（见 compute_ex_mask）。
+        # 只标记"窗口内整段无观测"的外生值列；缺失标记 / 年龄列不屏蔽；
+        # 日历列无 __missing 伴随列，永不屏蔽。
+        ex_mask_full = compute_ex_mask(x_full, self.ex_mask_layout)
+
+        # 日历通道拆分（calendar_mode）：日历列集合全股票一致
+        # （load_catalog 已校验），不存在日历列补零对齐。
+        mode = self.calendar_mode
+        empty_mark = np.zeros((self.seq_len, 0), dtype=np.float32)
+        if mode == "columns":
+            x, x_mark = x_full, empty_mark
+        elif mode == "time_marks":
+            x = x_full[:, self.keep_pos]
+            x_mark = (
+                x_full[:, self.mark_pos]
+                if len(self.mark_pos) else empty_mark
+            )
+        else:  # none
+            x = x_full[:, self.keep_pos]
+            x_mark = empty_mark
+
+        # ex_mask 重排到 x 的外生 token 顺序（columns 模式下为恒等）。
+        ex_mask = ex_mask_full[self.ex_mask_order]
 
         y = np.array([[labels[local]]], dtype=np.float32)
-        # 第五个元素：float64 原始标签（y_raw），评估侧直接使用；
-        # 第六个元素：ex_mask（是否启用由训练/推理脚本的 --ex-mask 决定）。
-        return x, y, sid, int(target), np.float64(raws[local]), ex_mask
+        # 返回 8 元组：x, y, sid, target, y_raw, ex_mask, x_mark, head_cal。
+        # y_raw 为 float64 原始标签（评估侧直接使用）；ex_mask 是否启用
+        # 由训练/推理脚本的 --ex-mask 决定，数据集恒产出；x_mark 为
+        # 时间标记通道（columns/none 模式下为 0 列）；head_cal 为目标日
+        # 星期 one-hot（预测头日历拼接的输入，恒产出）。
+        return (
+            x, y, sid, int(target), np.float64(raws[local]),
+            ex_mask, x_mark, self.head_onehot[sid][target],
+        )

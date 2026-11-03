@@ -88,7 +88,8 @@ def checkpoint(data_root, tmp_path_factory):
     path = tmp_path_factory.mktemp("pipeline_ckpt") / "checkpoint.pth"
     torch.save(
         {
-            "format": adapter.checkpoint_format,
+            # 格式号随 model_config 派生（head 开启 → v2，关闭 → v1）
+            "format": adapter.checkpoint_format_for(config),
             "schema": schema,
             "feature_schema": feature_schema_doc(schema),
             "preprocessing": {SYMBOL: prep},

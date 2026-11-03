@@ -27,7 +27,7 @@ def run_epoch(adapter, model, loader, device, optimizer=None,
     count = 0
 
     with torch.set_grad_enabled(training):
-        for x, y, sid, _, _, ex_mask in loader:
+        for x, y, sid, _, _, ex_mask, x_mark, head_cal in loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             sid = sid.to(device, non_blocking=True)
@@ -42,7 +42,20 @@ def run_epoch(adapter, model, loader, device, optimizer=None,
             else:
                 ex_mask = None
 
-            pred = adapter.forward(model, x, ex_mask=ex_mask)
+            # x_mark 时间标记通道：0 列（columns/none 模式）时传 None。
+            if x_mark.shape[-1]:
+                x_mark = x_mark.to(device, non_blocking=True)
+            else:
+                x_mark = None
+
+            # head_cal 数据集恒产出；是否使用由模型配置
+            # （head_calendar_dim）决定，适配器内部判定。
+            head_cal = head_cal.to(device, non_blocking=True)
+
+            pred = adapter.forward(
+                model, x, ex_mask=ex_mask, x_mark=x_mark,
+                head_calendar=head_cal,
+            )
             if pred.shape != y.shape:
                 raise ValueError(f"输出 {pred.shape} != 标签 {y.shape}")
 
@@ -72,13 +85,20 @@ def test_predictions(adapter, model, loader, records, device,
     model.eval()
     chunks = []
 
-    for x, y, sid, target, y_raw, ex_mask in loader:
+    for x, y, sid, target, y_raw, ex_mask, x_mark, head_cal in loader:
         # 与训练协议一致：use_ex_mask=False 时掩码不进入模型。
         if use_ex_mask:
             ex_mask = ex_mask.to(device, non_blocking=True)
         else:
             ex_mask = None
-        output = adapter.forward(model, x.to(device), ex_mask=ex_mask)
+        if x_mark.shape[-1]:
+            x_mark = x_mark.to(device, non_blocking=True)
+        else:
+            x_mark = None
+        output = adapter.forward(
+            model, x.to(device), ex_mask=ex_mask, x_mark=x_mark,
+            head_calendar=head_cal.to(device, non_blocking=True),
+        )
         if output.shape != y.shape:
             raise ValueError("测试输出维度不正确")
 

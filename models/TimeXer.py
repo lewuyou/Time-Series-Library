@@ -14,8 +14,14 @@ class FlattenHead(nn.Module):
         self.linear = nn.Linear(nf, target_window)
         self.dropout = nn.Dropout(head_dropout)
 
-    def forward(self, x):  # x: [bs x nvars x d_model x patch_num]
+    def forward(self, x, extra=None):  # x: [bs x nvars x d_model x patch_num]
+        # extra：可选 [B, extra_dim]（如目标日日历向量），展平后拼接
+        # 到线性层输入（构造时 nf 需已含 extra_dim）。extra=None 时
+        # 与原实现完全一致（head_calendar_dim=0 的既有 checkpoint 协议）。
         x = self.flatten(x)
+        if extra is not None:
+            extra = extra.unsqueeze(1).expand(-1, x.shape[1], -1)
+            x = torch.cat([x, extra], dim=-1)
         x = self.linear(x)
         x = self.dropout(x)
         return x
@@ -159,8 +165,13 @@ class Model(nn.Module):
             ],
             norm_layer=torch.nn.LayerNorm(configs.d_model)
         )
+        # head_calendar_dim：预测头可选拼接的目标日日历向量维数
+        # （0 = 关闭，结构与输出和上游原版完全等价；>0 时把目标日
+        # 星期 one-hot 拼进 FlattenHead 输入，向量由调用方提供，
+        # 见 adapters/timexer.py 与 CALENDAR_DESIGN.md）。
+        self.head_calendar_dim = int(getattr(configs, "head_calendar_dim", 0) or 0)
         self.head_nf = configs.d_model * (self.patch_num + 1)
-        self.head = FlattenHead(configs.enc_in, self.head_nf, configs.pred_len,
+        self.head = FlattenHead(configs.enc_in, self.head_nf + self.head_calendar_dim, configs.pred_len,
                                 head_dropout=configs.dropout)
 
     @staticmethod
@@ -180,7 +191,8 @@ class Model(nn.Module):
                 f'[batch={batch_size}, exogenous tokens={n_tokens}]')
         return ex_mask
 
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, ex_mask=None):
+    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, ex_mask=None,
+                 head_calendar=None):
         if self.use_norm:
             # Normalization from Non-stationary Transformer
             means = x_enc.mean(1, keepdim=True).detach()
@@ -205,7 +217,21 @@ class Model(nn.Module):
         # z: [bs x nvars x d_model x patch_num]
         enc_out = enc_out.permute(0, 1, 3, 2)
 
-        dec_out = self.head(enc_out)  # z: [bs x nvars x target_window]
+        if self.head_calendar_dim > 0:
+            if head_calendar is None:
+                raise ValueError(
+                    'head_calendar_dim > 0 requires head_calendar '
+                    '(target-day calendar vector)')
+            if tuple(head_calendar.shape) != (x_enc.shape[0], self.head_calendar_dim):
+                raise ValueError(
+                    f'head_calendar shape {tuple(head_calendar.shape)} does not match '
+                    f'[batch={x_enc.shape[0]}, head_calendar_dim={self.head_calendar_dim}]')
+            dec_out = self.head(enc_out, extra=head_calendar)
+        else:
+            if head_calendar is not None:
+                raise ValueError(
+                    'head_calendar_dim = 0 must not receive head_calendar')
+            dec_out = self.head(enc_out)  # z: [bs x nvars x target_window]
         dec_out = dec_out.permute(0, 2, 1)
 
         if self.use_norm:
@@ -217,6 +243,10 @@ class Model(nn.Module):
 
 
     def forecast_multi(self, x_enc, x_mark_enc, x_dec, x_mark_dec, ex_mask=None):
+        if self.head_calendar_dim > 0:
+            raise ValueError(
+                'forecast_multi (features=M) does not support '
+                'head_calendar_dim > 0')
         if self.use_norm:
             # Normalization from Non-stationary Transformer
             means = x_enc.mean(1, keepdim=True).detach()
@@ -251,7 +281,8 @@ class Model(nn.Module):
 
         return dec_out
 
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None, ex_mask=None):
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None, ex_mask=None,
+                head_calendar=None):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             if mask is not None:
                 # Previously `mask` was accepted but silently ignored. Refuse it
@@ -263,10 +294,14 @@ class Model(nn.Module):
                     'input; pass `ex_mask` ([B, n_ex_tokens] bool, True = masked) '
                     'to mask exogenous tokens')
             if self.features == 'M':
+                if head_calendar is not None:
+                    raise ValueError(
+                        'forecast_multi does not support head_calendar')
                 dec_out = self.forecast_multi(x_enc, x_mark_enc, x_dec, x_mark_dec, ex_mask=ex_mask)
                 return dec_out[:, -self.pred_len:, :]  # [B, L, D]
             else:
-                dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec, ex_mask=ex_mask)
+                dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec, ex_mask=ex_mask,
+                                        head_calendar=head_calendar)
                 return dec_out[:, -self.pred_len:, :]  # [B, L, D]
         else:
             return None

@@ -78,11 +78,17 @@ infer 模式的历史快照一致性：
     rzrq 比率字段原单位为百分数，/100.0 转为小数是正确的；
     akshare_tx.volume 单位为股，特征使用 log1p；turnover 本身即小数。
 
-目标日星期 one-hot（target_dow_mon..fri，v8 起）：
-    每行的目标日 = 下一交易日（该行作为输入日时的预测目标）。
-    星期是已知的日历信息，不引入未来数据；样本窗口最后一行
-    （决策行）即该样本目标日的星期，与 latest.npz 的 target_date
-    口径一致。one-hot 保持 0/1，不标准化、恒不缺失。
+目标日日历列（schema v3 起，全部按目标日 = 下一交易日取值）：
+    - 时间标记列 target_mark_dow/dom/doy：官方日频三特征（与
+      utils/timefeatures.py 同式），默认经 calendar_mode=time_marks
+      移入 x_mark 通道（官方通道）；
+    - 旗标列 target_gap_days_log / target_is_gap_ge4 /
+      target_is_pre_long_holiday / target_is_month_start_3 /
+      target_is_month_end_3：长假间隔与月初月末，纯交易日历推导。
+    日历是已知的日历信息，不引入未来数据；样本窗口最后一行
+    （决策行）即该样本目标日的日历属性，与 latest.npz 的 target_date
+    口径一致。日历列恒不缺失、不标准化。星期 one-hot 不再作为列
+    导出（由 x_mark 时间标记与预测头 one-hot 承载）。
 
 运行示例：
     # 单股训练数据（as-of 默认取库内最新行情日）
@@ -217,15 +223,13 @@ from stock.data.features import build_features, fixed_transform
 from stock.data.preprocessing import fit_preprocessing, transform
 from stock.data.schema import (
     TARGET,
-    TARGET_DOW_NAMES,
     age_col,
-    dow_column,
     feature_schema_doc,
     is_companion_col,
-    is_dow_col,
     is_exogenous_col,
     is_missing_col,
     missing_col,
+    parse_calendar_features,
 )
 from stock.data.sources import (
     empty_series,
@@ -317,6 +321,11 @@ def parse_args():
     )
     p.add_argument("--min-feature-coverage", type=float, default=0.60)
     p.add_argument("--min-observations", type=int, default=100)
+    p.add_argument(
+        "--calendar-features", default="all",
+        help="prepare：启用的目标日日历特征列（all/none/逗号列表，默认 all）；"
+             "写入预处理配置并随导出规格登记，infer 由冻结配置复现",
+    )
 
     p.add_argument(
         "--macro-fields", nargs="+", choices=["close", "volume"],
@@ -433,6 +442,9 @@ def main():
             "decision_hour": args.decision_hour,
             "decision_minute": args.decision_minute,
             "baidu_keyword": args.baidu_keyword,
+            "calendar_features": parse_calendar_features(
+                args.calendar_features
+            ),
         }
 
     results = []

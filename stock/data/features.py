@@ -7,10 +7,19 @@ from stock.data.common import PRICE_FIELDS
 from stock.data.pit import align_one
 from stock.data.schema import (
     TARGET,
-    TARGET_DOW_NAMES,
+    TARGET_CALENDAR_EXTRA_NAMES,
+    TARGET_GAP_DAYS_LOG,
+    TARGET_IS_GAP_GE4,
+    TARGET_IS_MONTH_END_3,
+    TARGET_IS_MONTH_START_3,
+    TARGET_IS_PRE_LONG_HOLIDAY,
+    TARGET_MARK_DOY,
+    TARGET_MARK_DOM,
+    TARGET_MARK_DOW,
+    TARGET_MARK_NAMES,
     age_col,
-    dow_column,
     missing_col,
+    target_calendar_columns,
 )
 from stock.data.targets import target_series
 
@@ -20,6 +29,83 @@ def fixed_transform(values, kind):
     if kind == "signed_log1p":
         return np.sign(values) * np.log1p(np.abs(values))
     return values
+
+
+def target_calendar_features(calendar, index, enabled):
+    """目标日日历特征：行 t 存 t 的下一交易日（预测目标日）的属性。
+
+    全部由交易日历推导（禁止"日期 >= 28"、"dayofweek + 1"之类的近似）：
+      - target_mark_dow/dom/doy：官方日频三特征（与
+        utils/timefeatures.py 的 DayOfWeek/DayOfMonth/DayOfYear 同式），
+        但按目标交易日取值（第 t 行放 t+1 个交易日的日历值），避免
+        输入日/目标日错位一天；
+      - target_gap_days_log：log1p(输入日到目标日的自然日数)，
+        周五->周一 = 3，长假后可达 8~10；
+      - target_is_gap_ge4：自然间隔 >= 4 天（目标日是长假后首个交易日）；
+      - target_is_pre_long_holiday：目标日是长假前最后一个交易日
+        （目标日到它下一交易日的间隔 >= 4）；目标日为日历末端时
+        无法判定，取 0；
+      - target_is_month_start_3 / target_is_month_end_3：目标日是其所在
+        月份的前/后 3 个交易日（按完整日历内该月交易日排序）。
+
+    calendar：完整交易日历（必须覆盖 index 每行的下一交易日）；
+    index：特征矩阵行索引（calendar 的子集）；
+    enabled：启用的日历列名集合（仅返回其中的日历列）。
+    返回 {列名: float64 数组}。
+    """
+    enabled = set(enabled)
+    wanted = [c for c in target_calendar_columns() if c in enabled]
+    if not wanted:
+        return {}
+
+    pos = calendar.get_indexer(index)
+    if (pos < 0).any():
+        raise ValueError("index 含不在交易日历中的日期")
+    if (pos + 1 >= len(calendar)).any():
+        raise ValueError("每行都必须存在下一交易日（日历须覆盖 as-of 之后）")
+
+    next_pos = pos + 1
+    next_dates = calendar[next_pos]
+    gap = (next_dates - index).days.astype(np.float64)
+
+    out = {}
+    # 官方归一化写法（日频版）：与 hour/23-0.5 同一套 [-0.5, 0.5] 风格。
+    if TARGET_MARK_DOW in enabled:
+        out[TARGET_MARK_DOW] = next_dates.dayofweek / 6.0 - 0.5
+    if TARGET_MARK_DOM in enabled:
+        out[TARGET_MARK_DOM] = (next_dates.day - 1) / 30.0 - 0.5
+    if TARGET_MARK_DOY in enabled:
+        out[TARGET_MARK_DOY] = (next_dates.dayofyear - 1) / 365.0 - 0.5
+    if TARGET_GAP_DAYS_LOG in enabled:
+        out[TARGET_GAP_DAYS_LOG] = np.log1p(gap)
+    if TARGET_IS_GAP_GE4 in enabled:
+        out[TARGET_IS_GAP_GE4] = (gap >= 4).astype(np.float64)
+    if TARGET_IS_PRE_LONG_HOLIDAY in enabled:
+        pre = np.zeros(len(index), dtype=np.float64)
+        has_after = next_pos + 1 < len(calendar)
+        if has_after.any():
+            gap_after = (
+                calendar[next_pos[has_after] + 1] - next_dates[has_after]
+            ).days
+            pre[has_after] = (gap_after >= 4).astype(np.float64)
+        out[TARGET_IS_PRE_LONG_HOLIDAY] = pre
+    if (
+        TARGET_IS_MONTH_START_3 in enabled
+        or TARGET_IS_MONTH_END_3 in enabled
+    ):
+        periods = calendar.to_period("M")
+        base = pd.Series(periods)
+        rank = base.groupby(periods).cumcount() + 1
+        size = base.groupby(periods).transform("size")
+        rank_v = rank.to_numpy()[next_pos]
+        size_v = size.to_numpy()[next_pos]
+        if TARGET_IS_MONTH_START_3 in enabled:
+            out[TARGET_IS_MONTH_START_3] = (rank_v <= 3).astype(np.float64)
+        if TARGET_IS_MONTH_END_3 in enabled:
+            out[TARGET_IS_MONTH_END_3] = (
+                (size_v - rank_v) < 3
+            ).astype(np.float64)
+    return out
 
 
 
@@ -109,17 +195,25 @@ def build_features(prices, calendar, as_of, specs, config):
     # aligned_values.csv 中 px_volume 仍保留原值。
     features["px_volume"] = np.log1p(features["px_volume"])
 
-    # 目标日星期 one-hot（周一~周五）：行 t 的目标日 = 以该行为输入日
-    # 时的预测目标，即下一交易日（decision 的日期部分）。星期是纯日历
-    # 信息，预测时点完全已知，不引入未来数据；样本窗口 [start..end] 的
-    # 目标日 date[end+1] 的 one-hot 恰为窗口最后一行（决策行），窗口内
-    # 其余各行各自表示"以该行为输入日"的目标日星期（窗口互相重叠，
-    # 行级存储无法整窗恒定）。交易日只落在周一~周五，5 列完整覆盖；
-    # 恒不缺失，不生成 __missing / __age_days 伴随列，也不参与屏蔽。
-    target_dow = next_date.reindex(index).dt.dayofweek
-    for i, name in enumerate(TARGET_DOW_NAMES):
-        col = dow_column(name)
-        features[col] = (target_dow == i).astype(float)
+    # 目标日日历列（3 个官方时间标记列 + 5 个旗标列）：行 t 的目标日 =
+    # 以该行为输入日时的预测目标，即下一交易日（decision 的日期部分）。
+    # 日历是纯日历信息，预测时点完全已知，不引入未来数据；样本窗口
+    # [start..end] 的目标日 date[end+1] 的属性恰为窗口最后一行（决策行），
+    # 窗口内其余各行各自表示"以该行为输入日"的目标日属性（窗口互相重叠，
+    # 行级存储无法整窗恒定）。恒不缺失，不生成 __missing / __age_days
+    # 伴随列，也不参与标准化与屏蔽。星期 one-hot 不再作为列导出
+    # （星期信息由 x_mark 时间标记通道与预测头 one-hot 承载）。
+    # 启用集合由 config["calendar_features"] 决定（缺省 = 全部，兼容旧
+    # 冻结配置）；不同集合构成不同导出规格，装载期禁止混用。
+    enabled_calendar = config.get("calendar_features")
+    if enabled_calendar is None:
+        enabled_calendar = target_calendar_columns()
+    enabled_calendar = set(enabled_calendar)
+
+    for col, values in target_calendar_features(
+        calendar, index, enabled_calendar
+    ).items():
+        features[col] = values
         groups[col] = [col]
 
     # 辅助来源按各自的可用时间对齐，禁止 bfill。

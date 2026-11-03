@@ -36,12 +36,16 @@ from stock.utils import date_text, read_json, write_json
 # export.py 五个入口函数的源码哈希基线（以当前远程版本为准）。
 # 这些函数体被 export_config.json 的 sha 校验与历史 data-root 复用依赖，
 # 任何改动都必须伴随新的导出目录，不能静默修改。
+# 基线更新（P6 日历特征）：parse_args/init_worker/main 因新增
+# --calendar-features 参数而变化；resolve_split/export_one 未改动。
+# 旧 data-root 的 export_config.json 记录了旧哈希，复用校验会显式失败，
+# 符合"日历列改变 schema 必须重导"的约束。
 EXPORT_FUNCTION_SHA256 = {
-    "parse_args": "fc7c14cec3a7c354d68901de9b3302175d5f3efc39a56cf5c886844a9dcd210e",
+    "parse_args": "0683093509b8cd97db4a02e063f37ce22cf1dc3bcf8618d13155339bed03e91e",
     "resolve_split": "185c4aa1bb4a1adf873aba73ba916caa23742942de565b05c5fbb1c3081fec22",
-    "init_worker": "dcf645587f725577d4355e1fd2bbfbb92f7a711bb562cb549175faf5bf3eafbc",
+    "init_worker": "3e2be9d28574e000804ebff2787a33487fbfe469fa53218e0afef822674cbbf9",
     "export_one": "f4494cac09b5a7e4f30309af12a1a25c636477d03c361a8770b737b6b4392b0e",
-    "main": "4bd1d3aef68999f7dd79b318bc5b9f40b55cb17c4467cb4503696f2c75f8f06f",
+    "main": "7771888cd856d55cdcf27dc2a3628487aeed633b2344cfd395c4c61ac8caddb3",
 }
 
 
@@ -259,8 +263,8 @@ def test_module_symbol_bindings():
     assert ds.TARGET == schema.TARGET
     assert ds.missing_col("a") == "a__missing"
     assert ds.age_col("a") == "a__age_days"
-    assert ds.dow_column("mon") == "target_dow_mon"
-    assert ds.is_dow_col("target_dow_mon")
+    # target_dow_* one-hot 已删除（P6 新设计）：星期信息由 x_mark
+    # 时间标记通道与预测头 one-hot 承载，dow_column/is_dow_col 不复存在。
     assert ds.is_exogenous_col("baidu_x")
     assert not ds.is_exogenous_col("px_close")
     assert schema_mod.align_features is schema.align_features

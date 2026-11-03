@@ -169,6 +169,12 @@ def parse_args():
              "Train+Val 合并训练、无验证集，必须显式提供 --as-of 与 "
              "--train-end，--train-end 即 fit_end，不得提供 --val-end）",
     )
+    p.add_argument(
+        "--calendar-features", default="all",
+        help="启用的目标日日历列：all（默认，3 个时间标记列 + 5 个旗标列）"
+             "/ none / 逗号分隔列名子集（A/B 用）。不同集合构成不同导出规格，"
+             "登记进 export_config.json，禁止与旧规格目录混用",
+    )
     return p.parse_args()
 
 
@@ -179,18 +185,22 @@ from stock.data.splits import resolve_split  # noqa: E402,F401
 
 def init_worker(db, data_root, as_of, train_end, val_end,
                 seq_len, min_train_samples, min_eval_samples,
-                train_start=None, split_layout="train_val_test"):
+                train_start=None, split_layout="train_val_test",
+                calendar_features="all"):
     """进程级初始化：只读 duckdb 连接 + 交易日历 + 预处理配置。
 
     train_start 为 "YYYY-MM-DD" 或 None：rolling 训练窗口的最早目标日，
     传入 dataset.py 的 --start（保留原始历史用于窗口与指标预热）。
     split_layout 见 dataset.SPLIT_LAYOUTS；train_test 时 val_end 必须为
     None（无验证集，train_end 即重拟合截止日 fit_end）。
+    calendar_features：目标日日历列集合（"all"/"none"/逗号列表），
+    解析后写入预处理 config，随导出规格登记。
     """
     if split_layout not in ds.SPLIT_LAYOUTS:
         raise ValueError(f"不支持的 split_layout：{split_layout}")
     if split_layout == "train_test" and val_end is not None:
         raise ValueError("train_test 布局的 val_end 必须为 None")
+    calendar_columns = ds.parse_calendar_features(calendar_features)
     con = duckdb.connect(db, read_only=True)
     calendar, calendar_info = ds.load_calendar(
         con, None, ds.DEFAULT_CALENDAR_START, 50
@@ -206,6 +216,7 @@ def init_worker(db, data_root, as_of, train_end, val_end,
         "decision_hour": 8,
         "decision_minute": 30,
         "baidu_keyword": None,
+        "calendar_features": calendar_columns,
     }
     max_lookback = max(
         x["max_age_days"] + x["lag_days"] for x in policies.values()
@@ -376,9 +387,14 @@ def main():
     root = Path(a.data_root)
     root.mkdir(parents=True, exist_ok=True)
 
+    # 提前解析并校验日历列集合；作为导出规格的一部分登记，规格不同
+    # 的目录禁止复用（old != spec 即要求新 data-root）。
+    calendar_columns = ds.parse_calendar_features(a.calendar_features)
+
     spec = {
         "export_version": "global_export_wf_v2",
         "split_layout": a.split_layout,
+        "calendar_features": calendar_columns,
         "db": str(Path(a.db).resolve()),
         "as_of": str(as_of.date()),
         "train_end": str(train_end.date()),
@@ -432,6 +448,7 @@ def main():
             a.min_eval_samples,
             train_start,
             a.split_layout,
+            a.calendar_features,
         ),
     ) as pool:
         futures = {

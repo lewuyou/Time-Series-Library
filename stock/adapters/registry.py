@@ -7,7 +7,11 @@ _FORMAT_INDEX = {}
 
 
 def register_adapter(adapter):
-    """登记适配器实例（同名 / 同格式号重复登记视为代码错误）。"""
+    """登记适配器实例（同名 / 同格式号重复登记视为代码错误）。
+
+    适配器的 extra_formats（如有）是同一适配器管辖的其它格式号
+    （如 TimeXer 的预测头扩展版），同样登记进格式索引。
+    """
     if not adapter.name or not adapter.checkpoint_format:
         raise ValueError("适配器必须定义 name 与 checkpoint_format")
     if adapter.name in _REGISTRY:
@@ -18,6 +22,10 @@ def register_adapter(adapter):
         )
     _REGISTRY[adapter.name] = adapter
     _FORMAT_INDEX[adapter.checkpoint_format] = adapter
+    for fmt in getattr(adapter, "extra_formats", ()):
+        if fmt in _FORMAT_INDEX:
+            raise ValueError(f"checkpoint 格式号冲突：{fmt}")
+        _FORMAT_INDEX[fmt] = adapter
     return adapter
 
 
