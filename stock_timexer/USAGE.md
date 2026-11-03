@@ -474,32 +474,45 @@ PY
 
 ---
 
-## 5. `dataset.py` 的现状（没有拆，也没有被删除改动）
+## 5. `dataset.py` 的现状（P5 已拆分为薄入口 + `stock/data/` 职责模块）
 
-### 5.1 结论
+### 5.1 拆分后的结构
 
-- `dataset.py` 仍是**单体数据引擎**，P5（继续拆 `data/`）没有做。
-- 删除老脚本的提交 `a944176` **没有修改** `dataset.py`；`git diff f1a7548 a944176 -- dataset.py` 为空。
-- 断链修复提交 `4fc96b6` 也没有修改它。
-- 不继续拆的直接原因：`export_config.json` 里登记 `dataset_script_sha256 = sha256(dataset.py)`；任何对 `dataset.py` 的改动都会让**已存在的 data-root 不能原地重导**（必须换新目录），旧目录仍可被读取/`validate`，但配置一致性检查会拒绝复用。
+`dataset.py`（根目录）现在是一个**薄 CLI 入口**：保留原来的全部 CLI 参数与 `--mode prepare|infer|validate` 行为，实现全部按职责拆进 `stock/data/`，旧函数名（`prepare_one`、`load_calendar`、`make_samples`……）在 `dataset` 模块命名空间仍可 import（兼容转发，`import dataset as ds` 的旧代码不受影响）。
 
-### 5.2 P1 只在以下位置改动（当前行号）
-
-| 行号 | 改动 |
+| 模块 | 职责（关键符号） |
 | --- | --- |
-| `dataset.py:178-180` | 从 `stock.data.targets` 导入 `label_valid as is_label_valid`、`target_series`、`target_spec` |
-| `dataset.py:760-761` | 目标公式改用 `target_series(p["close"], ...)`（simple / log 的单一事实源） |
-| `dataset.py:914` | 标签有效性改用 `is_label_valid(...)` |
-| `dataset.py:1307-1316` | `preprocessing.json` 写入 `feature_schema`（版本+hash）与 `target_spec` |
-| `dataset.py:1478` | 单股目录写出完整 `feature_schema.json` |
-| `dataset.py:1511-1512` | `manifest.json` 新增 `target_spec` 与 `feature_schema` 两个键 |
+| `stock/data/common.py` | 共享常量与小工具：`VERSION`/`SPLIT_LAYOUTS`/字段清单、`norm_symbol`/`sql_symbol`/`parse_dates`/`as_numeric`/`load_policies` |
+| `stock/data/calendar.py` | 交易日历：`load_calendar`/`calendar_fingerprint`/`calendar_dates_sha256` |
+| `stock/data/splits.py` | 切分边界倒推：`resolve_split`（自 `stock/data/export.py` 原样迁出，函数体逐字未动，export 侧转发 import） |
+| `stock/data/sources.py` | 原始数据读取与序列规格：`select_stocks`/`load_prices`/`load_stock_aux`/`load_macro`/`make_specs_from_long` |
+| `stock/data/pit.py` | Point-in-time 对齐与审计：`align_one`/`source_watermarks`/`history_drift_report` |
+| `stock/data/features.py` | 特征构造：`fixed_transform`/`build_features` |
+| `stock/data/targets.py` | 目标列（此前已存在）：`target_series`/`target_spec`/`label_valid` |
+| `stock/data/preprocessing.py` | 预处理：`fit_preprocessing`/`transform` |
+| `stock/data/windows.py` | 样本窗口：`make_samples` |
+| `stock/data/builder.py` | 单股导出编排：`prepare_one`/`save_latest`/`load_asof`/`coverage_report` |
+| `stock/data/validation.py` | 离线验收：`validate_dataset`（`--mode validate` 的全部检查项） |
+| `stock/data/export.py` | 批量导出（P3 已存在）；`resolve_split` 已迁往 `splits.py` 并从那里转发 |
+| `dataset.py` | 薄入口：docstring + 兼容转发 + `parse_args`/`main` + `StockTimeXerDataset`（单股独立训练循环） |
 
-### 5.3 它在新结构里的角色
+### 5.2 `dataset_script_sha256` 兼容规则（重要）
 
-- 被 `python -m stock.data.export` 调用：批量导出复用 `dataset.prepare_one`，不另写一套取数逻辑。
-- 作为独立入口仍负责 `prepare` / `infer` / `validate`（单股排查与导出验收）。
-- **不再被训练脚本直接调用**：训练侧读 data-root，经 `stock.data.panel.load_catalog` / `stock.data.schema` 装载；`stock.training.runner` 不 import `dataset` 的训练逻辑。
-- `preprocessing.json` / `manifest.json` 里的 `feature_schema` 与 `target_spec` 是 checkpoint 契约（`feature_schema_hash` / `dataset_id`）的来源。
+- 该哈希 = sha256(根目录 `dataset.py`)，登记在 `export_config.json`（export 写入）与 checkpoint/walk-forward manifest（runner 登记）。它只是**导出脚本的身份指纹，不是数据契约**。
+- 旧 data-root 的 `--mode validate` / `--mode infer` **不比对该哈希**：脚本改动（含 P5 拆分）后旧目录照常可用。
+- 只有**原地重导**（`--out-dir` 指向已存在的导出目录）会被 `prepare_one` 的 `FileExistsError` 拒绝——口径变更必须换新目录，避免新旧代码产物混在同一 data-root。
+- 判断两份导出是否同口径，比对 manifest 的 `feature_schema`/日历指纹/config，不要用该哈希。
+- 上述规则也写在 `dataset.py` 头部注释与 `tests/test_dataset_equiv.py`。
+
+### 5.3 等价性验证（P5 实测）
+
+拆分前 HEAD `f71203f` 与拆分后，同一只股票（601398）、同一组参数（`--as-of 2026-10-14 --train-end 2023-12-29 --val-end 2025-06-30 --seq-len 60`）各导一份：`feature_matrix.npy` / `dates.npy` / `samples.csv` / `aligned_values.csv` / `features_unscaled.csv` **逐字节一致**，`preprocessing.json` 既有键与值一致。固化在 `tests/test_dataset_equiv.py`（`-m slow`，本地已实跑 5/5 通过；基线对比需 `P5_EQ_BASELINE` 指向旧代码导出目录）。
+
+### 5.4 它在新结构里的角色
+
+- `--mode prepare|infer|validate` 单股排查入口（本手册第 1 节的底层）。
+- 被 `python -m stock.data.export` 调用（批量导出复用 `dataset.prepare_one`）。
+- **不被训练脚本直接调用**：训练侧读 data-root，经 `stock.data.panel.load_catalog` / `stock.data.schema` 装载。
 
 ---
 
@@ -517,6 +530,8 @@ PY
 | 2.4 `runner --mode train --model TimesNet` | 实跑通过（1 epoch，schema/特征哈希/日期覆盖与 TimeXer 逐字节一致） |
 | 2.4 `runner --mode predict --model TimesNet checkpoint` | 实跑通过（`status=ok`） |
 | 2.4 `walk_forward --model timesnet` | 实跑通过（1 折，`fold_000`，5 个测试日） |
+| 5.3 数据层拆分 A/B（拆分前 HEAD vs 拆分后，601398 同参数） | 实跑通过（核心产物逐字节一致） |
+| 5.3 `tests/test_dataset_equiv.py -m slow`（含 `P5_EQ_BASELINE` 基线对比） | 实跑通过（5 passed） |
 | 3.1 `daily_pipeline` 发布 | 实跑通过（`published`，`run_id=run-20261015-20261103T084918-07f5dd6d`） |
 | 3.2 阻断 | 实跑通过（`blocked`，退出码 1，不写 CSV） |
 | 3.3 读库 sqlite3 + pandas | 实跑通过 |
