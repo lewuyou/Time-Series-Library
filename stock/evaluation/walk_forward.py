@@ -631,6 +631,41 @@ def parse_args():
     return p.parse_args()
 
 
+def _pit_summary(pit_universe):
+    """OOS 结果的 PIT 能力标记（与 plan 的 pit_universe 段同口径）。
+
+    真缺口 #7 的残留补齐：walk_forward_plan.json 已在 --pit-universe
+    时写明分类，但拼接后的 oos_summary.json 缺机器可读标记，
+    单看摘要文件无法识别评估的 PIT 等级。
+    """
+    if pit_universe:
+        return {
+            "universe_mode": "pit_selected",
+            "pit_capability": "approximate_pit",
+            "pit_criteria": [
+                "listed_by_as_of", "quote_history_span_days",
+                "quote_days", "has_rzrq", "has_fresh_baidu",
+            ],
+            "snapshot_criteria": [
+                "top_mv_rank", "baidu_keyword_name_mapping",
+                "industry_l2", "stock_list_membership",
+            ],
+            "note": (
+                "部分 PIT：上市日期/行情/两融/百度按 as-of 时点评估；"
+                "市值排名与简称映射仍是当前快照"
+            ),
+        }
+    return {
+        "universe_mode": "fixed_input_pool",
+        "pit_capability": "conditional_history",
+        "note": (
+            "固定输入股票池属于条件性历史评估；"
+            "股票池构成不受 as-of 约束（详见 walk_forward_plan.json "
+            "的 limitations 与 --pit-universe 说明）"
+        ),
+    }
+
+
 def main():
     a = parse_args()
 
@@ -1073,6 +1108,7 @@ def main():
         ds.json_write(root / "fold_metrics.json", fold_metrics)
 
         if not a.refit:
+            summary["_pit"] = _pit_summary(bool(a.pit_universe))
             ds.json_write(root / "oos_summary.json", summary)
             print(
                 f"\n[OK] folds={len(folds)}, oos_rows={len(oos)}, "
@@ -1101,6 +1137,7 @@ def main():
             "budget_rule": "same_epochs",
             "refit_window_policy": a.refit_window_policy,
             "refit": summary,
+            "pit": _pit_summary(bool(a.pit_universe)),
             "selection_control": control_summary,
             "comparison": comparison,
         })

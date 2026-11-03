@@ -72,6 +72,20 @@ def save_test_report(frame, out):
             "rank_ic_days": len(daily_ic),
         }
 
+    # 口径声明（真缺口 #6 残留）：防止把重叠窗口数误读成独立样本量。
+    summary["_semantics"] = {
+        "n_semantics": "overlapping_windows",
+        "n_note": (
+            "pooled/stock_equal_* 的样本数 n 是重叠滚动窗口数"
+            "（相邻窗口共享 seq_len-1 个样本），样本间不独立，"
+            "不能当作独立样本量用于显著性检验"
+        ),
+        "daily_ic_semantics": (
+            "mean_daily_rank_ic 按 target_date 逐日聚合"
+            "（日度近似独立）；rank_ic_days 为参与聚合的交易日数"
+        ),
+    }
+
     frame.to_csv(out / "test_predictions.csv", index=False)
     pd.DataFrame(per_stock).to_csv(
         out / "test_metrics_by_stock.csv", index=False

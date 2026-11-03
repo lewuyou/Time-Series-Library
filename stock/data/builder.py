@@ -410,6 +410,16 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
                 {k: v for k, v in spec.items() if k != "series"}
                 for spec in macro_specs
             ],
+            # 机器可读的 PIT 能力声明（limitations 之外的单字段版，
+            # 供下游按 "approximate_pit" 做一致解读/过滤）：库内无
+            # 发布时间字段，行情/辅助数据按观测日 <= as-of 近似。
+            "pit_capability": {
+                "level": "approximate_pit",
+                "reason": (
+                    "原表没有实际发布时间；source_watermarks 只是"
+                    "入库水位，不能证明 point-in-time"
+                ),
+            },
             "limitations": [
                 "原表没有实际发布时间，采用配置的可用时间假设；"
                 "source_watermarks 只是入库水位，不能证明 point-in-time。",

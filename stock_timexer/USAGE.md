@@ -178,6 +178,8 @@ cd /root/projects/Time-Series-Library
   - `test_metrics.json`、`test_metrics_by_stock.csv`、`test_predictions.csv`
 - 成功判据：终端出现 `共享 checkpoint 已保存：checkpoints/global_001/checkpoint.pth`，退出码 0
 
+> 指标口径：`test_metrics.json`（与 walk-forward 的 `oos_summary.json`）的 `_semantics` 键声明——`pooled/stock_equal_*` 的 `n` 是**重叠滚动窗口数**（相邻窗口共享 seq_len-1 个样本，非独立样本量，不能用于显著性检验）；`mean_daily_rank_ic` 按 `target_date` 逐日聚合（日度近似独立）。`oos_summary.json` 另带 `_pit` 键（股票池评估的 PIT 等级：固定池=条件性历史评估，`--pit-universe`=approximate_pit）。
+
 > 老入口：`train_stock.py` / `train_global_timexer.py` / `8_train_timexer.sh` 已删除，替代写法就是本命令。
 > 训练侧只接受 `stock.data.export` 产出的 data-root；直接拿 `dataset.py --out-dir` 的单股目录训练会因缺少 `export_config.json` / `export_results.csv` 失败。
 
@@ -531,6 +533,8 @@ PY
 | 2.4 `walk_forward --model timesnet` | 实跑通过（1 折，`fold_000`，5 个测试日） |
 | 5.3 数据层拆分 A/B（拆分前 HEAD vs 拆分后，601398 同参数） | 实跑通过（核心产物逐字节一致） |
 | 5.3 `tests/test_dataset_equiv.py -m slow`（含 `P5_EQ_BASELINE` 基线对比） | 实跑通过（5 passed） |
+| 生产管线端到端 `tests/test_daily_pipeline.py -m slow`（发布落库+CSV 视图+readiness 阻断留档） | 实跑通过（1 passed；含随机权重 checkpoint 冒烟） |
+| `oos_summary.json` 的 `_pit`/`_semantics` 与 manifest 的 `pit_capability` | 固定池分支端到端实测通过（timesnet 1 折）；`--pit-universe`（approximate_pit）分支单元级断言通过，全池端到端因导出耗时未跑（未验证） |
 | 3.1 `daily_pipeline` 发布 | 实跑通过（`published`，`run_id=run-20261015-20261103T084918-07f5dd6d`） |
 | 3.2 阻断 | 实跑通过（`blocked`，退出码 1，不写 CSV） |
 | 3.3 读库 sqlite3 + pandas | 实跑通过 |

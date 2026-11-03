@@ -48,3 +48,14 @@
 4. R11 不需要开发，直接用现成入口跑对照即可。
 
 > 未验证项说明：本续评为只读评审，R1–R13 的"现状核实"基于源码检查与 P0–P5 的既有实测记录（见各 commit message 与 USAGE 第 6 节），未运行新的长任务（如全池 walk-forward 双模型对照）。
+
+## 4. 落地记录（本节随实施 commit 更新）
+
+| 条目 | 落地方式 | 实测 |
+|---|---|---|
+| R1 口径声明 | `metrics.py` `save_test_report` 的 summary 顶层新增 `_semantics`（`n_semantics: "overlapping_windows"` + 两条 note），随 `test_metrics.json` / `oos_summary.json` 一并落盘；USAGE §2.1 补口径说明 | timesnet 1 折冒烟：`oos_summary.json` 含 `_semantics.n_semantics=overlapping_windows` |
+| R2 oos_summary PIT 标记 | `walk_forward._pit_summary()`：按 `--pit-universe` 与否写 `universe_mode`/`pit_capability`（`approximate_pit` / `conditional_history`）+ criteria/note；非 refit 写入 `summary["_pit"]`，refit 路径顶层加 `"pit"` 键。`walk_forward_plan.json` 原有 pit_universe 段未动 | 固定池分支端到端实测通过（timesnet 1 折冒烟，`conditional_history`）；`--pit-universe` 分支单元级断言通过（`_pit_summary(True)`），全池端到端因筛选导出耗时过长未跑（**未验证**，原因：全池 777+ 只逐折导出预计 40 分钟以上） |
+| R13 manifest 能力字段 | `builder.py` manifest 新增机器可读 `"pit_capability": {"level": "approximate_pit", ...}`（`limitations` 之外的单字段版） | 1 折导出 manifest 实测含该键 |
+| R9 管线端到端测试 | 新增 `tests/test_daily_pipeline.py`（slow+skipif 真库）：临时 data-root + 契约完整随机权重 checkpoint；场景 1 发布（run 落库 published、predictions 行、CSV 视图）；场景 2 `--max-lag-days 5` 触发 readiness「数据滞后」阻断（blocked 留档、exit 1、无 CSV） | 1 passed（16s） |
+
+其余条目维持第 3 节判定不变（R3–R7 推迟/不采纳，R8/R10–R12 维持原判）。
