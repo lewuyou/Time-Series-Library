@@ -110,7 +110,11 @@ def executable_returns(signals, prices, hold_days=1, fee_bps=0.0,
             "entry_date": entry_date, "exit_date": exit_date,
             "exec_return": value,
         })
-    return pd.DataFrame(out)
+    # 零信号时也返回带完整列的空表，保证下游 dropna(subset=["exec_return"])
+    # 等按列聚合不抛 KeyError
+    return pd.DataFrame(out, columns=[
+        "symbol", "target_date", "entry_date", "exit_date", "exec_return",
+    ])
 
 
 def _has(open_wide, close_wide, entry_date, exit_date, symbol):

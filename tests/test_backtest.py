@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from stock.evaluation.backtest import run_backtest
+from stock.evaluation.backtest import executable_returns, run_backtest
 from stock.evaluation.daily_hit import daily_hit
 
 DATES = ["2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07"]
@@ -117,3 +117,56 @@ def test_hold_period_and_missing_price(tmp_path):
     assert trades["exec_return"].isna().sum() >= 0
     # 持有期越界/缺价的行必须显式计为 unpriced，而不是丢弃
     assert len(trades) == len(signals)
+
+
+TRADE_COLUMNS = [
+    "symbol", "target_date", "entry_date", "exit_date", "exec_return",
+]
+
+
+def test_executable_returns_zero_signals():
+    """零信号：返回带完整列的空表，下游按列聚合不抛 KeyError。"""
+    signals = pd.DataFrame(columns=["symbol", "target_date", "y_pred"])
+    trades = executable_returns(signals, _prices())
+    assert list(trades.columns) == TRADE_COLUMNS
+    assert len(trades) == 0
+    priced = trades.dropna(subset=["exec_return"])
+    assert len(priced) == 0
+
+
+def test_executable_returns_partial_signals():
+    """部分信号：可定价与不可定价（越界/缺价）并存。"""
+    prices = _prices()
+    signals = pd.DataFrame([
+        {"symbol": "S0", "target_date": DATES[1]},   # 正常定价
+        {"symbol": "S1", "target_date": DATES[-1]},  # hold_days=2 越界 → NaN
+        {"symbol": "S9", "target_date": DATES[1]},   # 无行情 → NaN
+    ])
+    trades = executable_returns(signals, prices, hold_days=2)
+    assert list(trades.columns) == TRADE_COLUMNS
+    assert len(trades) == 3
+    priced = trades.dropna(subset=["exec_return"])
+    assert len(priced) == 1
+    assert priced.iloc[0]["symbol"] == "S0"
+
+
+def test_executable_returns_full_signals():
+    """全信号：所有成交均可定价，无 NaN。"""
+    signals = pd.DataFrame([
+        {"symbol": symbol, "target_date": DATES[1]} for symbol in SYMBOLS
+    ])
+    trades = executable_returns(signals, _prices(), hold_days=1)
+    assert list(trades.columns) == TRADE_COLUMNS
+    assert len(trades) == len(SYMBOLS)
+    assert trades["exec_return"].notna().all()
+
+
+def test_run_backtest_zero_signals_end_to_end():
+    """端到端：floor 极高导致零信号时，executable 分支不抛 KeyError。"""
+    predictions = _predictions()
+    report, _, signals = run_backtest(
+        predictions, prices=_prices(), q_pct=25, floor_pct=1e6,
+    )
+    assert len(signals) == 0
+    assert report["executable"]["n"] == 0
+    assert report["executable"]["hit_rate"] is None
