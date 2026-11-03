@@ -60,10 +60,9 @@ def train(args, device):
         )
 
     seq_len = train_ds.seq_len
-    if args.patch_len < 1 or seq_len % args.patch_len:
-        raise ValueError("patch-len 必须整除 seq_len")
-    if args.d_model % args.n_heads:
-        raise ValueError("d-model 必须能被 n-heads 整除")
+    # 模型专属校验由适配器声明（TimeXer 管 patch/heads，TimesNet 管
+    # top_k 的 FFT 频段上限等）；通用路径不写死任何模型的规则。
+    adapter.validate_args(args, seq_len)
 
     config = adapter.model_config(args, seq_len, schema)
 
@@ -334,10 +333,9 @@ def train_refit(args, device):
             )
 
     seq_len = train_ds.seq_len
-    if args.patch_len < 1 or seq_len % args.patch_len:
-        raise ValueError("patch-len 必须整除 seq_len")
-    if args.d_model % args.n_heads:
-        raise ValueError("d-model 必须能被 n-heads 整除")
+    # 模型专属校验由适配器声明（TimeXer 管 patch/heads，TimesNet 管
+    # top_k 的 FFT 频段上限等）；通用路径不写死任何模型的规则。
+    adapter.validate_args(args, seq_len)
 
     config = adapter.model_config(args, seq_len, schema)
 
@@ -567,6 +565,20 @@ def build_train_parser():
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--patch-len", type=int, default=10)
+    # TimesNet 专属（由适配器 cli_params 声明并校验，其他模型忽略）：
+    p.add_argument("--d-ff", type=int,
+                   help="TimesNet：TimesBlock Inception 中间宽度，"
+                        "缺省 d-model*2")
+    p.add_argument("--top-k", type=int, default=5,
+                   help="TimesNet：FFT 主周期个数（≤(seq_len+1)//2）")
+    p.add_argument("--num-kernels", type=int, default=6,
+                   help="TimesNet：Inception 卷积核尺寸数")
+    p.add_argument(
+        "--use-norm", action="store_true",
+        help="TimesNet：开启窗口内 RevIN 归一化（默认关闭＝与 "
+             "TimeXer 协议一致，特征保持导出期尺度；开启会污染 "
+             "0/1 缺失标记通道，仅作消融对照）",
+    )
     p.add_argument(
         "--ex-mask",
         action="store_true",
@@ -604,7 +616,10 @@ def main(argv=None):
     if min(
         args.epochs, args.patience, args.batch_size,
         args.d_model, args.e_layers, args.n_heads,
-    ) < 1 or args.workers < 0:
+        args.top_k, args.num_kernels,
+    ) < 1 or args.workers < 0 or (
+        args.d_ff is not None and args.d_ff < 1
+    ):
         raise ValueError("数量参数不合法")
 
     random.seed(args.seed)

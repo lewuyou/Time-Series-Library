@@ -247,6 +247,51 @@ printf 'symbol,name,industry_l2\n000001,平安银行,银行Ⅱ\n' > dataset/trai
 
 > 老入口：`1_train_single_stock.sh` 与 `4_train_macro_symbols.sh` 的训练段。行业批量老脚本（`2_` / `3_`）同理：把行业股票写进 `universe.csv` 即可。
 
+### 2.4 切换模型：TimeXer vs TimesNet
+
+第二个模型 TimesNet 已接入（`stock/adapters/timesnet.py`，网络本体拷贝为 `stock/adapters/timesnet_model.py`）。`--model` 参数在 `stock.training.runner` 与 `stock.evaluation.walk_forward` 都可用，名字大小写不敏感（`--model timesnet` 等价 `--model TimesNet`）。
+
+两模型的关键差异：
+
+| | TimeXer | TimesNet |
+|---|---|---|
+| checkpoint 格式号 | `global_timexer_typed_v1` | `timesnet_mv_v1` |
+| 输入语义 | 内生 patch token（目标）+ 外生 value token，区分内生/外生 | **全特征通道**同质读入（含目标末列、外生值列、`__missing` 缺失标记列），无 token 结构 |
+| `ex_mask` | 支持（`--ex-mask`，token 级掩码） | **不支持**（开了 `--ex-mask` 启动即报错，不静默退化） |
+| `use_norm` | 固定 0（特征保持导出期尺度） | 默认 0；`--use-norm` 可开（会污染 0/1 缺失标记通道，仅作消融对照） |
+| 目标通道 | projection 输出目标 | 输出末列（schema 最后一列＝目标列） |
+| 模型专属参数 | `--d-model --e-layers --n-heads --patch-len --dropout --ex-mask` | `--d-model --d-ff --e-layers --top-k --num-kernels --dropout --use-norm` |
+
+TimesNet 参数含义：`--top-k`＝FFT 主周期个数（约束 `top-k ≤ (seq_len+1)//2`，否则启动前报错）；`--num-kernels`＝Inception 卷积核尺寸数（默认 6）；`--d-ff`＝TimesBlock 中间宽度（缺省 `d-model*2`）；`seq_len` 不需要被 `top-k` 整除（TimesBlock 零填充对齐）。
+
+TimesNet 训练（其余与 2.1/2.3 完全相同，只换 `--model` 和专属参数）：
+
+```bash
+.venv/bin/python -m stock.training.runner --mode train \
+  --model TimesNet \
+  --data-root dataset/global_001 \
+  --out-dir checkpoints/global_001_timesnet \
+  --epochs 30 --patience 5 --batch-size 256 --workers 0 \
+  --d-model 64 --e-layers 2 --top-k 5 --num-kernels 6 --device auto
+```
+
+TimesNet 的 walk-forward（第 4 节回测链路同理，只是加 `--model`）：
+
+```bash
+.venv/bin/python -m stock.evaluation.walk_forward \
+  --db ../AutoTS/download/autots.duckdb \
+  --universe-csv dataset/global_001/universe.csv \
+  --run-root walkforward/timesnet_001 \
+  --first-test-date 2025-01-01 --last-test-date 2025-12-31 \
+  --val-days 60 --test-days 20 --seq-len 60 \
+  --model timesnet --d-model 64 --e-layers 2 --top-k 5 \
+  --epochs 30 --patience 5 --device auto
+```
+
+预测/每日选股/回测命令**不需要任何改动**：checkpoint 里登记了 `format`（`timesnet_mv_v1`），`predict` / `predict_daily` 自动反查适配器。同一份 data-root 用两个模型训练，产出的 `schema.json` / 特征哈希 / 日期覆盖完全相同（已实测），`test_predictions.csv` 字段结构相同，只是 `y_pred` 不同。
+
+通用路径（runner / predictor / walk_forward / daily_pipeline）不含任何模型专属硬编码：模型构造、参数校验、CLI 透传都由 `stock/adapters/` 的适配器声明（`cli_params` / `validate_args`）。新增第三个模型＝在 `stock/adapters/` 加一个适配器并在 `stock/adapters/__init__.py` 追加一行导入。
+
 ---
 
 ## 3. 每日预测 / 选股
@@ -469,6 +514,9 @@ PY
 | 2.1 `runner --mode train` | 实跑通过（1 epoch） |
 | 2.2 `runner --mode refit` | 实跑通过（1 epoch，`best_epoch=1`） |
 | 2.3 单只 universe 导出 + 训练 | 实跑通过（`000001`） |
+| 2.4 `runner --mode train --model TimesNet` | 实跑通过（1 epoch，schema/特征哈希/日期覆盖与 TimeXer 逐字节一致） |
+| 2.4 `runner --mode predict --model TimesNet checkpoint` | 实跑通过（`status=ok`） |
+| 2.4 `walk_forward --model timesnet` | 实跑通过（1 折，`fold_000`，5 个测试日） |
 | 3.1 `daily_pipeline` 发布 | 实跑通过（`published`，`run_id=run-20261015-20261103T084918-07f5dd6d`） |
 | 3.2 阻断 | 实跑通过（`blocked`，退出码 1，不写 CSV） |
 | 3.3 读库 sqlite3 + pandas | 实跑通过 |

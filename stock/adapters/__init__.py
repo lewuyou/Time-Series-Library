@@ -23,6 +23,7 @@ from stock.adapters.registry import (
 
 # 导入即注册内置适配器（TimeXer 等）；新增适配器在此追加一行。
 from stock.adapters import timexer  # noqa: F401
+from stock.adapters import timesnet  # noqa: F401
 
 __all__ = [
     "ModelAdapter",

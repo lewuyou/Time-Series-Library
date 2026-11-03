@@ -601,6 +601,19 @@ def parse_args():
     p.add_argument("--e-layers", type=int, default=2)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--patch-len", type=int, default=10)
+    # TimesNet 专属（由适配器 cli_params 声明并透传；其他模型忽略）：
+    p.add_argument("--d-ff", type=int,
+                   help="TimesNet：TimesBlock Inception 中间宽度，"
+                        "缺省 d-model*2")
+    p.add_argument("--top-k", type=int, default=5,
+                   help="TimesNet：FFT 主周期个数（≤(seq_len+1)//2）")
+    p.add_argument("--num-kernels", type=int, default=6,
+                   help="TimesNet：Inception 卷积核尺寸数")
+    p.add_argument(
+        "--use-norm", action="store_true",
+        help="TimesNet：开启窗口内 RevIN 归一化（默认关闭；透传给 "
+             "stock.training.runner --use-norm，仅作消融对照）",
+    )
     p.add_argument(
         "--ex-mask", action="store_true",
         help="屏蔽窗口内整段无观测的外生值 token（透传给 "

@@ -22,10 +22,22 @@ def register_adapter(adapter):
 
 
 def get_adapter(name):
-    """按模型名取适配器（train_stock.py --model）。"""
+    """按模型名取适配器（train_stock.py --model）。
+
+    精确匹配优先；未命中时做大小写不敏感的唯一匹配（登记名与
+    上游模型文件名保持同大小写，如 TimeXer/TimesNet，允许命令行
+    写 --model timesnet 这类小写形式），有歧义即报错。
+    """
     try:
         return _REGISTRY[name]
     except KeyError:
+        lowered = name.lower()
+        matches = [
+            adapter for key, adapter in _REGISTRY.items()
+            if key.lower() == lowered
+        ]
+        if len(matches) == 1:
+            return matches[0]
         available = ", ".join(sorted(_REGISTRY)) or "<无>"
         raise ValueError(
             f"未知模型适配器：{name}（可用：{available}）"

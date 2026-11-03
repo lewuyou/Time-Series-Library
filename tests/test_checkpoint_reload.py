@@ -12,21 +12,23 @@ from stock.data.schema import feature_schema_doc
 from stock.inference.predictor import verify_feature_schema
 
 
-def _adapter_and_config():
-    adapter = get_adapter("TimeXer")
+def _adapter_and_config(model_name="TimeXer"):
+    adapter = get_adapter(model_name)
     args = argparse.Namespace(
         d_model=8, e_layers=1, n_heads=2, patch_len=5,
         dropout=0.1, ex_mask=False,
+        d_ff=None, top_k=5, num_kernels=6, use_norm=False,
     )
     schema = ["px_close_ret", "px_volume_log", "stock_return"]
     config = adapter.model_config(args, 10, schema)
     return adapter, config, schema
 
 
-def _saved(schema):
+def _saved(schema, model_name="TimeXer"):
+    adapter = get_adapter(model_name)
     return {
-        "format": "global_timexer_typed_v1",
-        "model": "TimeXer",
+        "format": adapter.checkpoint_format,
+        "model": adapter.name,
         "schema": schema,
         "feature_schema": feature_schema_doc(schema),
         "preprocessing": {},
@@ -46,21 +48,23 @@ def _prep(schema):
     }
 
 
-def test_checkpoint_roundtrip_preserves_output():
-    adapter, config, schema = _adapter_and_config()
+@pytest.mark.parametrize("model_name", ["TimeXer", "TimesNet"])
+def test_checkpoint_roundtrip_preserves_output(model_name):
+    adapter, config, schema = _adapter_and_config(model_name)
     model = adapter.build_model(config)
     model.eval()
     x = torch.randn(2, 10, len(schema))
     with torch.no_grad():
         before = adapter.forward(model, x)
 
-    path = Path("/tmp/tsl_test_checkpoint.pth")
+    path = Path(f"/tmp/tsl_test_checkpoint_{model_name}.pth")
     torch.save({"metadata": {"format": adapter.checkpoint_format},
                 "state_dict": model.state_dict()}, path)
     saved = torch.load(path, map_location="cpu", weights_only=False)
     loaded_adapter = adapter_for_checkpoint(
         saved["metadata"]["format"]
     )
+    assert loaded_adapter.name == model_name
     loaded = loaded_adapter.build_model(config)
     loaded.load_state_dict(saved["state_dict"])
     loaded.eval()
