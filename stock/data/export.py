@@ -2,15 +2,14 @@
 """批量导出股票池数据，供共享模型联合训练（完整流程第 2 步）。
 
 自根目录 export_global.py 原样迁入：resolve_split / init_worker /
-export_one / main 的函数体逐字保留（行为不变），根目录保留同名兼容
-shim 转发旧命令，walk-forward 每折子进程继续走 export_global.py 入口。
-json 原子写与文件哈希仍经 dataset.py 的别名指向 stock/utils.py 的
-全仓唯一实现。export_config.json 的 export_script_sha256 登记本模块
-文件的哈希（__file__ 即实现所在，不随 shim 变化），断点续跑的口径
-一致性检查不受迁移影响；旧 data-root 因脚本哈希变化需换新目录重导，
-与历史上任何一次代码修改的处理一致。
+export_one / main 的函数体逐字保留（行为不变）。根目录 shim 已删除，
+本模块即唯一入口。json 原子写与文件哈希仍经 dataset.py 的别名指向
+stock/utils.py 的全仓唯一实现。export_config.json 的
+export_script_sha256 登记本模块文件的哈希（__file__ 即实现所在），
+断点续跑的口径一致性检查不受迁移影响；旧 data-root 因脚本哈希变化
+需换新目录重导，与历史上任何一次代码修改的处理一致。
 
-新用法（推荐，与旧命令 `python export_global.py ...` 完全等价）：
+用法（旧的根目录 `python export_global.py ...` 已删除，等价写法）：
 
     python -m stock.data.export --db ../AutoTS/download/autots.duckdb \
         --universe-csv dataset/global_001/universe.csv \
@@ -19,7 +18,7 @@ json 原子写与文件哈希仍经 dataset.py 的别名指向 stock/utils.py �
 
 完整流程（第 1~4 步）：
     第 1 步 粗筛股票池
-        python select_universe.py --db ../AutoTS/download/autots.duckdb \
+        python -m stock.selection.universe --db ../AutoTS/download/autots.duckdb \
             --out dataset/global_001/universe.csv \
             --top-mv 3000 --min-years 3 --baidu-fresh-days 30
 
@@ -32,7 +31,7 @@ json 原子写与文件哈希仍经 dataset.py 的别名指向 stock/utils.py �
         的股票进入共享训练。
 
     第 3 步 联合训练
-        python train_stock.py --mode train \
+        python -m stock.training.runner --mode train \
             --data-root dataset/global_001 \
             --out-dir checkpoints/global_timexer_001 \
             --epochs 30 --patience 5 --batch-size 256 --workers 0 \
@@ -45,7 +44,7 @@ json 原子写与文件哈希仍经 dataset.py 的别名指向 stock/utils.py �
         python dataset.py --mode infer --db ../AutoTS/download/autots.duckdb \
             --preprocessor dataset/global_001/601398/preprocessing.json \
             --out-dir dataset/global_infer_001 --fail-on-history-drift
-        python train_stock.py --mode predict \
+        python -m stock.training.runner --mode predict \
             --checkpoint checkpoints/global_timexer_001/checkpoint.pth \
             --data-dir dataset/global_infer_001/601398 --device auto
 
@@ -93,11 +92,12 @@ json 原子写与文件哈希仍经 dataset.py 的别名指向 stock/utils.py �
       后与 checkpoint 结构不兼容。
 
 walk-forward 滚动评估（第 5 步，可选）：
-    python walk_forward.py --db ... --universe-csv ... --run-root runs/wf_001 \
+    python -m stock.evaluation.walk_forward --db ... --universe-csv ... \
+        --run-root runs/wf_001 \
         --first-test-date 2024-01-02 --last-test-date 2024-12-31 \
         --val-days 60 --test-days 20 ...
     调度器按交易日历生成互不重叠的测试折，每折用显式边界调用本模块
-    独立导出（独立拟合预处理），再调用 train_stock.py 从头
+    独立导出（独立拟合预处理），再调用 stock.training.runner 从头
     训练，最后拼接所有折的样本外预测。
 
     加 --refit 启用两阶段协议（推荐对照实验）：每折先按 train_val_test
@@ -107,8 +107,8 @@ walk-forward 滚动评估（第 5 步，可选）：
     选择阶段的测试预测同时保留为无重拟合对照（协议 A）。
 
 注意：
-    select_universe.py 的粗筛（行情天数等）不保证百度/两融各自覆盖
-    训练期，最终以本模块导出后的复检结果为准。
+    stock.selection.universe 的粗筛（行情天数等）不保证百度/两融各自
+    覆盖训练期，最终以本模块导出后的复检结果为准。
 """
 
 import argparse

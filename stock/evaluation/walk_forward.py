@@ -28,10 +28,11 @@
     前面折的训练预算。跨折 warm-start 不在本协议内（见"已知局限"）。
 
 [--pit-universe：每折部分 PIT 股票池]
-    每折调用 select_universe.py --as-of 独立生成股票池：选择阶段按
-    A 时点、重拟合阶段按 B 时点重新确定资格（U_select 与 U_refit 可
-    不同）。可按时点评估的资格项：上市日期、行情历史、两融/百度历史；
-    市值排名与简称映射仍是当前快照（部分 PIT，详见 select_universe.py）。
+    每折调用 `python -m stock.selection.universe --as-of` 独立生成股票池：
+    选择阶段按 A 时点、重拟合阶段按 B 时点重新确定资格（U_select 与
+    U_refit 可不同）。可按时点评估的资格项：上市日期、行情历史、两融/百度
+    历史；市值排名与简称映射仍是当前快照（部分 PIT，详见
+    stock/selection/universe.py）。
     测试块内不新增股票；按当时交易状态与输入有效性决定是否发信号。
     不要根据测试期表现或数据完整性回头筛股票。
 
@@ -74,7 +75,7 @@
                                --refit 时含重拟合/选择对照/公共样本诊断
     fit_timing.csv             （--refit）各阶段"数据截止 -> 拟合起止 ->
                                首个预测时刻"时点链登记
-    data/<fold_id>/            每折导出目录（export_global.py 输出；
+    data/<fold_id>/            每折导出目录（stock.data.export 输出；
                                --refit 时分 selection/ 与 refit/ 两套）
     data/<fold_id>/pit_universes.json（--pit-universe）每折股票池资格
                                时点、路径与哈希
@@ -90,7 +91,7 @@
     oos/test_metrics.json      拼接后总指标
     oos/test_metrics_by_stock.csv
 
-已知局限（在单次评估基础上新增/放大，详见 train_stock.py）：
+已知局限（在单次评估基础上新增/放大，详见 stock/training/runner.py）：
     1. 固定输入 universe.csv 属于条件性历史评估：股票池由当前市值、
        当前存续名单、当前简称等决定，walk-forward 不能解决股票池的
        point-in-time 问题；--pit-universe 只是部分 PIT（市值排名与
@@ -117,7 +118,7 @@
 
 运行示例：
     # expanding，无重拟合（协议 A）
-    python walk_forward.py \
+    python -m stock.evaluation.walk_forward \
         --db ../AutoTS/download/autots.duckdb \
         --universe-csv dataset/global_001/universe.csv \
         --run-root runs/wf_expanding_001 \
@@ -130,7 +131,7 @@
 
     # 两阶段协议（协议 B），rolling 对照（最近约三年训练标签）：
     # 增加 --train-days 732 --refit，并使用新的 --run-root
-    python walk_forward.py \
+    python -m stock.evaluation.walk_forward \
         --db ../AutoTS/download/autots.duckdb \
         --universe-csv dataset/global_001/universe.csv \
         --run-root runs/wf_refit_rolling_732_001 \
@@ -147,6 +148,7 @@
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -158,10 +160,13 @@ import pandas as pd
 import dataset as ds
 
 from stock.adapters import get_adapter
+from stock.data import export as export_module
 from stock.evaluation.metrics import save_test_report
+from stock.selection import universe as universe_module
+from stock.training import runner as runner_module
 from stock.utils import date_text
 
-# stock/evaluation/walk_forward.py -> 仓库根（子进程脚本都在根目录）
+# stock/evaluation/walk_forward.py -> 仓库根（子进程用 -m 调用 stock.* 模块）
 SCRIPT_DIR = Path(__file__).resolve().parents[2]
 
 
@@ -284,15 +289,23 @@ def build_folds(calendar, first_test_date, last_test_date, val_days,
 
 def run_command(command):
     print("\n>>>", " ".join(map(str, command)), flush=True)
-    subprocess.run(command, check=True)
+    # 子进程用 python -m 调 stock.* 模块：保留调用方 cwd（相对路径参数
+    # 语义不变），只把仓库根加进 PYTHONPATH 保证模块可导入。
+    env = os.environ.copy()
+    root = str(SCRIPT_DIR)
+    env["PYTHONPATH"] = (
+        root if not env.get("PYTHONPATH")
+        else root + os.pathsep + env["PYTHONPATH"]
+    )
+    subprocess.run(command, check=True, env=env)
 
 
 def export_command(a, db, universe, data_root, fold, layout,
                   train_end, val_end=None, train_start_key="train_start"):
-    """构造 export_global.py 命令（显式日期边界）。"""
+    """构造 stock.data.export 命令（显式日期边界）。"""
     command = [
         sys.executable,
-        str(SCRIPT_DIR / "export_global.py"),
+        "-m", "stock.data.export",
         "--db", db,
         "--universe-csv", str(universe),
         "--data-root", str(data_root),
@@ -317,7 +330,7 @@ def export_command(a, db, universe, data_root, fold, layout,
 
 
 def train_command(a, data_root, out_dir, mode, epochs=None, extra=None):
-    """构造 train_stock.py 命令（共享模型参数一份）。
+    """构造 stock.training.runner 命令（共享模型参数一份）。
 
     模型专属参数由适配器的 cli_params 声明；调度器不再写死 TimeXer，
     也不会把 TimeXer 参数透传给其他模型。
@@ -325,7 +338,7 @@ def train_command(a, data_root, out_dir, mode, epochs=None, extra=None):
     adapter = get_adapter(getattr(a, "model", "TimeXer"))
     command = [
         sys.executable,
-        str(SCRIPT_DIR / "train_stock.py"),
+        "-m", "stock.training.runner",
         "--model", adapter.name,
         "--mode", mode,
         "--data-root", str(data_root),
@@ -378,10 +391,10 @@ def load_fold_predictions(out_dir):
 
 
 def run_pit_universe(a, db, out_path, as_of, stage_label):
-    """调用 select_universe.py 按历史时点生成部分 PIT 股票池。"""
+    """调用 stock.selection.universe 按历史时点生成部分 PIT 股票池。"""
     command = [
         sys.executable,
-        str(SCRIPT_DIR / "select_universe.py"),
+        "-m", "stock.selection.universe",
         "--db", db,
         "--out", str(out_path),
         "--as-of", date_text(as_of),
@@ -525,9 +538,10 @@ def parse_args():
     )
     p.add_argument(
         "--pit-universe", action="store_true",
-        help="每折调用 select_universe.py --as-of 独立生成部分 PIT 股票池"
+        help="每折调用 python -m stock.selection.universe --as-of 独立生成"
+             "部分 PIT 股票池"
              "（选择阶段按 train_end 时点、重拟合阶段按 val_end 时点；"
-             "市值排名与简称映射仍是当前快照，见 select_universe.py）",
+             "市值排名与简称映射仍是当前快照，见 stock/selection/universe.py）",
     )
     p.add_argument("--pit-top-mv", type=int, default=3000,
                    help="--pit-universe 时的市值排名上限")
@@ -590,7 +604,7 @@ def parse_args():
     p.add_argument(
         "--ex-mask", action="store_true",
         help="屏蔽窗口内整段无观测的外生值 token（透传给 "
-             "train_stock.py --ex-mask，选择/重拟合两阶段一致；"
+             "stock.training.runner --ex-mask，选择/重拟合两阶段一致；"
              "默认关闭＝维持既有\"填补＋缺失标记\"协议，建议以消融"
              "实验对比后再采用）",
     )
@@ -753,14 +767,14 @@ def main():
             ),
             "dataset_script_sha256": ds.sha256_file(ds.__file__),
             "select_universe_script_sha256": (
-                ds.sha256_file(SCRIPT_DIR / "select_universe.py")
+                ds.sha256_file(Path(universe_module.__file__))
                 if a.pit_universe else None
             ),
             "export_script_sha256": ds.sha256_file(
-                SCRIPT_DIR / "export_global.py"
+                Path(export_module.__file__)
             ),
             "train_script_sha256": ds.sha256_file(
-                SCRIPT_DIR / "train_stock.py"
+                Path(runner_module.__file__)
             ),
             "folds": folds,
             "actual_last_test_date": folds[-1]["as_of"],

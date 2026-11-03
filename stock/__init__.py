@@ -9,6 +9,9 @@
 - stock.evaluation  指标、测试报告、walk-forward、命中率分析
 - stock.production  每日预测生产管线
 
-统一入口：train_stock.py（--model 选择适配器，默认 TimeXer）。
-旧的根目录入口脚本保留为兼容转发（train_global_timexer.py 等）。
+统一入口（根目录已不再保留转发脚本）：
+- 导出：`python -m stock.data.export`
+- 训练：`python -m stock.training.runner`
+- 选股池：`python -m stock.selection.universe`
+- 每日预测：`python -m stock.production.daily_pipeline`
 """

@@ -249,11 +249,11 @@ def test_date_text_and_json_writer():
         assert not (Path(td) / "new.json.tmp").exists()
 
 
-def test_shim_symbol_bindings():
+def test_module_symbol_bindings():
     import dataset as ds
-    import train_global_timexer as tgt
-    import walk_forward as wf
+    import stock.data.schema as schema_mod
     import stock.evaluation.metrics as metrics_mod
+    import stock.evaluation.walk_forward as wf
 
     assert ds.json_write is write_json
     assert ds.TARGET == schema.TARGET
@@ -263,16 +263,16 @@ def test_shim_symbol_bindings():
     assert ds.is_dow_col("target_dow_mon")
     assert ds.is_exogenous_col("baidu_x")
     assert not ds.is_exogenous_col("px_close")
-    assert tgt.align_features is schema.align_features
-    assert tgt.exogenous_mask_layout is schema.exogenous_mask_layout
-    assert tgt.compute_ex_mask is schema.compute_ex_mask
-    assert tgt.save_test_report is metrics_mod.save_test_report
+    assert schema_mod.align_features is schema.align_features
+    assert schema_mod.exogenous_mask_layout is schema.exogenous_mask_layout
+    assert schema_mod.compute_ex_mask is schema.compute_ex_mask
+    assert callable(metrics_mod.save_test_report)
     assert wf.date_text is date_text
     assert importlib.import_module("stock.production.daily_pipeline")
     assert importlib.import_module("stock.evaluation.daily_hit")
 
 
-def test_export_functions_frozen_and_shim_smoke():
+def test_export_functions_frozen_and_module_entry():
     new_export = importlib.import_module("stock.data.export")
     for name, expected in EXPORT_FUNCTION_SHA256.items():
         source = inspect.getsource(getattr(new_export, name))
@@ -282,20 +282,11 @@ def test_export_functions_frozen_and_shim_smoke():
             "必须换新的 data-root 并更新本测试基线"
         )
 
-    import export_global as eg
-    assert eg.main is new_export.main
-    assert eg.parse_args is new_export.parse_args
-    assert eg.resolve_split is new_export.resolve_split
-    assert eg.init_worker is new_export.init_worker
-    assert eg.export_one is new_export.export_one
     pickle.loads(pickle.dumps(new_export.export_one))
     pickle.loads(pickle.dumps(new_export.init_worker))
 
-    for cmd in (
-        [sys.executable, "export_global.py", "--help"],
+    proc = subprocess.run(
         [sys.executable, "-m", "stock.data.export", "--help"],
-    ):
-        proc = subprocess.run(
-            cmd, cwd=REPO, capture_output=True, text=True,
-        )
-        assert proc.returncode == 0 and "--universe-csv" in proc.stdout
+        cwd=REPO, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0 and "--universe-csv" in proc.stdout
