@@ -10,6 +10,11 @@ y_pred 同尺度），统计口径与原实现逐位一致。
     信号 = 排名前 q%（ceil） 且 预测涨幅 > floor%（默认 0.5%）；
     命中 = 当日信号股的 y_true > 0。
 
+oracle 参考上限（oracle_hit_rate）：
+    同一合格集合内按 y_true 完美排序取前 k（k=ceil(q%*当日股票数)，
+    与分位预算同口径、不受 floor 削减）的当日上涨比例；只作胜率理论
+    上限参考，不是可选股策略（真实决策时 y_true 未知）。
+
 输入：checkpoints/<run>/test_predictions.csv（最后 N 个交易日逐样本预测）
 输出（写入 <run>/）：
     quantile_daily_hit.csv            逐日：信号数/命中数/命中率/当日全池上涨占比
@@ -53,6 +58,14 @@ def daily_hit(frame, q_pct, floor_pct):
         )["signal"]
         sig = part[signal]
         hits = (sig.y_true > 0).sum() if len(sig) else 0
+        # oracle 参考上限：若按真实收益完美排序，取与分位预算同口径的
+        # 前 k（k=ceil(q%*当日合格数)，不受 floor 削减）的胜率。
+        # 并列按 (y_true 降序, symbol 升序) 显式排序，结果可复现。
+        oracle_k = int(np.ceil(len(part) * float(q_pct) / 100.0))
+        top = part.sort_values(
+            ["y_true", "symbol"], ascending=[False, True], kind="mergesort"
+        ).head(oracle_k)
+        oracle_hits = int((top.y_true > 0).sum())
         rows.append({
             "target_date": date,
             "signals": int(signal.sum()),
@@ -63,6 +76,9 @@ def daily_hit(frame, q_pct, floor_pct):
             "signal_mean_true_ret_pct": (
                 sig.y_true.mean() * 100 if len(sig) else np.nan
             ),
+            "oracle_signals": oracle_k,
+            "oracle_hits": oracle_hits,
+            "oracle_hit_rate": oracle_hits / oracle_k,
         })
     daily = pd.DataFrame(rows)
     pooled_signals = daily.signals.sum()
@@ -83,6 +99,10 @@ def daily_hit(frame, q_pct, floor_pct):
         ),
         "base_up_rate": float(frame.y_true.gt(0).mean()),
         "avg_daily_hit_rate": float(daily.hit_rate.mean()),
+        # 逐日基线上涨率均值（与逐日胜率同口径按天平均）
+        "avg_daily_base_up_rate": float(daily.day_up_base.mean()),
+        # oracle 上限按天平均（完美排序参考，见逐日 oracle_hit_rate）
+        "avg_oracle_hit_rate": float(daily.oracle_hit_rate.mean()),
         "signal_days": int((daily.signals > 0).sum()),
         "signal_mean_true_ret_pct": (
             float(np.mean(sig_returns)) if sig_returns else None

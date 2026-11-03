@@ -85,8 +85,12 @@
     oos/test_predictions.csv   所有折样本外预测合集（--refit 时来自重拟合
                                模型），附 fold_id 与该折训练边界，可追溯
                                每条预测来自哪个训练版本
+    oos/selection_daily.csv    逐日选股胜率（fold_id/信号数/命中数/胜率/
+                               同日基线上涨率/oracle 上限）
+    oos/selection_summary.json 整体与逐折选股胜率、跨折 mean/worst 汇总
     oos/selection_control/     （--refit）协议 A 对照：选择阶段测试预测
-                               与指标
+                               与指标（含同名 selection_daily.csv /
+                               selection_summary.json）
     oos/comparison.json         并入 oos_summary.json（--refit）
     oos/test_metrics.json      拼接后总指标
     oos/test_metrics_by_stock.csv
@@ -161,6 +165,7 @@ import dataset as ds
 
 from stock.adapters import get_adapter
 from stock.data import export as export_module
+from stock.evaluation.daily_hit import daily_hit
 from stock.evaluation.metrics import save_test_report
 from stock.selection import universe as universe_module
 from stock.training import runner as runner_module
@@ -441,6 +446,85 @@ def check_fold_frame(frame, fold, fold_id, stage_label):
         raise ValueError(f"{fold_id}/{stage_label}: 单折预测存在重复")
 
 
+def _finite_or_none(value):
+    """NaN/Inf → None（write_json 使用 allow_nan=False）。"""
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def aggregate_fold_selection(per_fold):
+    """跨折汇总：各折"按天平均"胜率/基线/oracle 的 mean 与 worst。
+
+    worst = 跨折最小值（最差折），用于稳健性报告；不挑选最好折。
+    """
+    keys = (
+        "avg_daily_hit_rate",
+        "avg_daily_base_up_rate",
+        "avg_oracle_hit_rate",
+    )
+    out = {}
+    for key in keys:
+        values = [
+            row[key] for row in per_fold
+            if isinstance(row.get(key), float) and np.isfinite(row[key])
+        ]
+        out[key] = {
+            "mean": float(np.mean(values)) if values else None,
+            "worst": float(np.min(values)) if values else None,
+        }
+    return out
+
+
+def selection_summary_block(frame, q_pct, floor_pct):
+    """OOS 预测的选股胜率统计（复用 daily_hit，与每日管线同口径）。
+
+    返回 (daily_all, block)：daily_all 为逐日表（含 fold_id）；block 含
+    整体/逐折统计与跨折 mean/worst。frame 必须带 fold_id 列。
+    """
+    daily_parts = []
+    per_fold = []
+    for fold_id, part in frame.groupby("fold_id"):
+        fold_daily, fold_stats = daily_hit(part, q_pct, floor_pct)
+        daily_parts.append(fold_daily.assign(fold_id=fold_id))
+        per_fold.append({
+            "fold_id": fold_id,
+            "days": fold_stats["days"],
+            "total_signals": fold_stats["total_signals"],
+            "pooled_hit_rate": fold_stats["pooled_hit_rate"],
+            "avg_daily_hit_rate": fold_stats["avg_daily_hit_rate"],
+            "avg_daily_base_up_rate": fold_stats["avg_daily_base_up_rate"],
+            "avg_oracle_hit_rate": fold_stats["avg_oracle_hit_rate"],
+        })
+    daily_all = pd.concat(daily_parts, ignore_index=True)
+    daily_all = daily_all.sort_values("target_date").reset_index(drop=True)
+    _, overall = daily_hit(frame, q_pct, floor_pct)
+    block = {
+        "quantile_pct": q_pct,
+        "floor_pct": floor_pct,
+        "note": (
+            "选股口径与每日管线一致（hybrid_signal：前 q% 且预测 > "
+            "floor）；基线为同日同合格集合上涨率；oracle 为按真实收益"
+            "完美排序的理论上限参考，不是可实现策略"
+        ),
+        "overall": {k: _finite_or_none(v) for k, v in overall.items()},
+        "per_fold": [
+            {k: _finite_or_none(v) for k, v in row.items()}
+            for row in per_fold
+        ],
+        "cross_fold": aggregate_fold_selection(per_fold),
+    }
+    return daily_all, block
+
+
+def write_selection_summary(frame, q_pct, floor_pct, out_dir):
+    """逐日表落 CSV、统计落 JSON，并返回可并入 oos_summary 的 block。"""
+    daily, block = selection_summary_block(frame, q_pct, floor_pct)
+    daily.to_csv(Path(out_dir) / "selection_daily.csv", index=False)
+    ds.json_write(Path(out_dir) / "selection_summary.json", block)
+    return block
+
+
 def protocol_comparison(control, treatment):
     """协议 A（选择阶段直出）与协议 B（Train+Val 重拟合）的诊断对照。
 
@@ -599,6 +683,16 @@ def parse_args():
              "eval_sample_minimum 作报告对照，不决定训练资格；与 "
              "val-days/test-days 的一致性在启动时检查）",
     )
+    p.add_argument(
+        "--quantile-pct", type=float, default=5.0,
+        help="选股胜率统计的逐日排名分位（百分数）；与 "
+             "stock.evaluation.daily_hit 缺省口径一致",
+    )
+    p.add_argument(
+        "--floor-pct", type=float, default=0.5,
+        help="选股胜率统计的预测涨幅下限（百分点）；与 "
+             "stock.evaluation.daily_hit 缺省口径一致",
+    )
     p.add_argument("--export-workers", type=int, default=4)
 
     p.add_argument("--epochs", type=int, default=30,
@@ -704,6 +798,9 @@ def main():
         a.min_train_samples, a.min_eval_samples, a.export_workers,
     ) < 1:
         raise ValueError("数量参数必须为正数")
+
+    if not (0.0 < a.quantile_pct <= 100.0) or a.floor_pct < 0:
+        raise ValueError("quantile-pct 必须在 (0, 100] 且 floor-pct >= 0")
 
     # 提前拦截：否则要等昂贵的数据导出跑完、到训练子进程才报错。
     # 校验规则由模型适配器声明（不同模型的内生约束不同）。
@@ -1138,6 +1235,9 @@ def main():
         ds.json_write(root / "fold_metrics.json", fold_metrics)
 
         if not a.refit:
+            summary["selection"] = write_selection_summary(
+                oos, a.quantile_pct, a.floor_pct, root / "oos"
+            )
             summary["_pit"] = _pit_summary(bool(a.pit_universe))
             ds.json_write(root / "oos_summary.json", summary)
             print(
@@ -1158,6 +1258,13 @@ def main():
 
         control_summary = save_test_report(
             control_oos, root / "oos" / "selection_control"
+        )
+        summary["selection"] = write_selection_summary(
+            oos, a.quantile_pct, a.floor_pct, root / "oos"
+        )
+        control_summary["selection"] = write_selection_summary(
+            control_oos, a.quantile_pct, a.floor_pct,
+            root / "oos" / "selection_control",
         )
         comparison = protocol_comparison(control_oos, oos)
 
