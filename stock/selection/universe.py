@@ -44,7 +44,7 @@ point-in-time（PIT）口径说明：
 
 说明：
     - 本模块只是入库数据的粗筛（快速排除明显不合格的股票）；百度/两融
-      特征是否真的进入模型，由 export_global.py 在导出后按
+      特征是否真的进入模型，由 stock.data.export 在导出后按
       preprocessing.json 的 feature_columns 复检（训练期覆盖率不足 0.6
       的列会被 dataset.py 丢弃，复检不通过的股票不训练）。
     - 这里的"三年"只是行情口径，不代表百度/两融各自都有三年数据，

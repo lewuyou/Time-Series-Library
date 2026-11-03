@@ -122,21 +122,21 @@ infer 模式的历史快照一致性：
     #       也可直接调用 ds.to_simple_return(prediction)。
 
 训练脚本：
-    共享训练使用 train_global_timexer.py（独立窗口、联合训练），
-    不依赖本模块，只读导出文件。注意 TimeXer 内生分支用不重叠 patch：
-    patch_len 必须整除 seq_len，否则 60/16 会丢弃最近 12 天目标历史，
-    训练脚本已内置该校验。
+    共享训练使用 stock.training.runner（python -m stock.training.runner，
+    独立窗口、联合训练），不依赖本模块，只读导出文件。注意 TimeXer
+    内生分支用不重叠 patch：patch_len 必须整除 seq_len，否则 60/16
+    会丢弃最近 12 天目标历史，训练脚本已内置该校验。
     本模块底部的 StockTimeXerDataset 保留用于单股训练的独立训练循环
     （features="MS"、pred_len=1、label_len=0，只读导出文件）。
 
-共享模型流程中的定位（完整流程见 export_global.py 头部说明）：
-    1. select_universe.py 粗筛股票池；
-    2. export_global.py 批量导出（复用本模块 prepare_one）并复检
+共享模型流程中的定位（完整流程见 stock.data.export 文档）：
+    1. stock.selection.universe 粗筛股票池；
+    2. stock.data.export 批量导出（复用本模块 prepare_one）并复检
        baidu_/rzrq_ 特征，产出 export_results.csv；
-    3. train_global_timexer.py 联合训练（不依赖本模块，只读导出文件）；
+    3. stock.training.runner 联合训练（不依赖本模块，只读导出文件）；
     4. 本模块 --mode validate 抽查导出质量；--mode infer 冻结训练期
-       预处理参数生成最新推理窗口，供 train_global_timexer.py
-       --mode predict 使用（同一股票必须复用训练期 scaler）。
+       预处理参数生成最新推理窗口，供 stock.inference.predictor
+       推理使用（同一股票必须复用训练期 scaler）。
 
 注意：
     这是自定义 Dataset 数据格式，不是 Dataset_Custom 的直接输入。

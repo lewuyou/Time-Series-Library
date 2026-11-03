@@ -210,7 +210,7 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
         )
         # 验证/测试覆盖率登记（两种布局一致）：单股下限只用于报告对照，
         # 不决定训练资格。整体层面"该折是否有足够验证证据选模型"由
-        # 训练装载检查（train_global_timexer）负责。
+        # 训练装载检查（stock.training.runner / stock.data.panel）负责。
         report["eval_sample_minimum"] = {
             "required_per_stock": args.min_eval_samples,
             "enforced": False,
