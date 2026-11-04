@@ -27,7 +27,7 @@ TARGET_SPEC = {
     "price_basis": "adjusted_close",
     "target_session": "next_trading_session",
     "suspension": "excluded; missing/invalid target-day OHLC => label_valid=False",
-    "decision_time": "next_trading_session 08:30",
+    "decision_time": "next_trading_session 06:00",
     "executable_return": (
         "not this label; executable backtest enters at target-day open"
     ),

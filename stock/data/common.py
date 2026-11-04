@@ -40,11 +40,18 @@ VAL_FIELDS = ["pe", "pb", "ps", "pcf"]
 RZRQ_FIELDS = ["fin_tval_ratio", "loan_tval_ratio"]
 
 # 可覆盖来源策略，也可精确覆盖到 "macro:品种:字段"。
+# PIT 校准（2026-11-04，决策时点改为 06:00）：
+# macro：观测日次日 05:00 可用（含美股周二场，北京时间约 05:00 收盘），
+#   lag 1 + release_hour 5 → 周三 06:00 决策可取周二观测；
+# guzhi：观测日次日 00:00 可用，lag 1 → 周三 06:00 可取周二；
+# rzrq：周二批次周三 09:00 才发布，晚于 06:00 决策 → lag 1 + release_hour 9
+#   使周二批 available=周三 09:00>06:00，自动回退取周一（语义精确化）；
+# baidu：周二批次周四 00:00 才可用，维持 lag 2，周三 06:00 仍只取周一，不动。
 DEFAULT_POLICIES = {
     "baidu": {"lag_days": 2, "release_hour": 0, "max_age_days": 7},
-    "guzhi": {"lag_days": 2, "release_hour": 0, "max_age_days": 10},
-    "rzrq": {"lag_days": 2, "release_hour": 0, "max_age_days": 5},
-    "macro": {"lag_days": 2, "release_hour": 0, "max_age_days": 10},
+    "guzhi": {"lag_days": 1, "release_hour": 0, "max_age_days": 10},
+    "rzrq": {"lag_days": 1, "release_hour": 9, "max_age_days": 5},
+    "macro": {"lag_days": 1, "release_hour": 5, "max_age_days": 10},
 }
 
 

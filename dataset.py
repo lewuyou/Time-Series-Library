@@ -26,7 +26,7 @@ holiday_calendar 推导（is_holiday_related 即休市标记），无需外部 C
 
 预测时点：
     历史行情截至交易日 t。
-    在下一交易日 t+1 的北京时间 08:30 形成预测。
+    在下一交易日 t+1 的北京时间 06:00 形成预测。
     预测 t+1 相对 t 的后复权收盘收益率。
 
 每个历史特征行的辅助数据均按该行自己的预测截止时间对齐。
@@ -146,7 +146,7 @@ infer 模式的历史快照一致性：
     但原表没有真实历史发布时间，不能严格证明历史当时可见；百度指数
     实际延迟、两融发布时刻、跨时区行情、宏观修订、历史复权更新需人工核实。
     当前股票列表、行业、市值用于选择处理对象，不作为历史数值特征。
-    预测的是统计口径的下一交易日收盘收益率；t+1 日 08:30 产生信号后
+    预测的是统计口径的下一交易日收盘收益率；t+1 日 06:00 产生信号后
     无法再按 t 日收盘价成交，该指标不能直接当作可实现交易收益。
 """
 
@@ -336,8 +336,8 @@ def parse_args():
         help="不指定时读取查询区间内全部宏观品种",
     )
     p.add_argument("--source-policy")
-    p.add_argument("--decision-hour", type=int, default=8)
-    p.add_argument("--decision-minute", type=int, default=30)
+    p.add_argument("--decision-hour", type=int, default=6)
+    p.add_argument("--decision-minute", type=int, default=0)
     p.add_argument(
         "--preprocessor",
         help="infer 必填：已有 preprocessing.json 路径",

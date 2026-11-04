@@ -380,7 +380,7 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
             ),
             "as_of": str(as_of.date()),
             # 预测时点：下一交易日 decision_hour:minute；导出时点未必等于
-            # 该时刻（例如周五收盘后导出的是"周一 08:30"的窗口，周末及
+            # 该时刻（例如周五收盘后导出的是"周一 06:00"的窗口，周末及
             # 周一早上的信息尚未到齐），由 source_watermarks 反映数据水位。
             "forecast_time": (
                 next_session
@@ -432,7 +432,7 @@ def prepare_one(con, row, args, calendar, as_of, macro_specs, config,
                 "holiday_calendar，可能存在误差。",
                 "未自动识别接口以平价零量记录表示的停牌，需要来源核验。",
                 "预测的是统计口径收益率，不等于可实现交易收益"
-                "（t+1 早 08:30 出信号后无法按 t 收盘价成交）。",
+                "（t+1 早 06:00 出信号后无法按 t 收盘价成交）。",
             ],
         }
         if frozen is not None:

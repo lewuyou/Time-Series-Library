@@ -12,8 +12,8 @@ def prediction_time(spec):
     """首个测试预测时刻：test_start 的 decision_hour:minute（Asia/Shanghai）。"""
     ts = pd.Timestamp(spec["test_start"])
     ts = ts + pd.Timedelta(
-        hours=int(spec.get("decision_hour", 8)),
-        minutes=int(spec.get("decision_minute", 30)),
+        hours=int(spec.get("decision_hour", 6)),
+        minutes=int(spec.get("decision_minute", 0)),
     )
     return ts.tz_localize("Asia/Shanghai")
 

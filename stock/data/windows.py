@@ -18,7 +18,7 @@ def make_samples(features, core_valid, config, train_end, val_end,
         fit_end，包含原验证区间）为 train，其余为 test，不产生 val 样本。
 
     样本口径区分"可预测 / 可评分"：
-      输入窗口有效的行全部保留（该预测在目标日早 08:30 本可合法发出），
+      输入窗口有效的行全部保留（该预测在目标日早 06:00 本可合法发出），
       其中目标日无有效行情或标签的行标记 label_valid=False、y_raw 为空，
       保留在 samples.csv 中作为覆盖登记；监督训练/评估装载时只取
       label_valid=True 的行（见 fit_preprocessing / PanelWindows）。
