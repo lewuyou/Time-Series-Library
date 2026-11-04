@@ -33,6 +33,30 @@ from stock.evaluation.metrics import save_test_report
 from stock.utils import now_text, read_json, sha256_file, write_json
 
 
+def resolve_device(name):
+    """设备解析：训练默认 GPU；仅显式 --device cpu 才用 CPU。
+
+    请求 cuda（或 auto）而 CUDA 不可用时立即报错，禁止静默回退
+    CPU——历史上 wf_orchestrate 硬编码 device="cpu" 叠加 auto 的
+    静默降级，使整套 walk-forward 精评在 CPU 上跑了数小时而无人
+    察觉（见 TUNING_LOG「运行环境」节）。
+    """
+    name = str(name)
+    if name not in ("auto", "cpu", "cuda"):
+        raise ValueError(f"非法 --device：{name!r}")
+    if name == "cpu":
+        return torch.device("cpu")
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "请求设备 "
+            + ("auto（优先 cuda）" if name == "auto" else "cuda")
+            + "，但 torch.cuda.is_available()=False。训练必须跑在 "
+            "GPU 上：请先修复 CUDA 环境；确需 CPU 必须显式传 "
+            "--device cpu（不推荐，仅应急）。"
+        )
+    return torch.device("cuda")
+
+
 def train(args, device):
     if not args.data_root or not args.out_dir:
         raise ValueError("train 需要 --data-root 和 --out-dir")
@@ -673,7 +697,12 @@ def build_train_parser():
              "TimeXer 专属，TimesNet 必须 --no-head-calendar",
     )
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    p.add_argument(
+        "--device", choices=["auto", "cpu", "cuda"], default="cuda",
+        help="训练设备：默认 cuda（auto 等价于 cuda）；仅显式 "
+             "--device cpu 才用 CPU；请求 cuda 而不可用时立即报错，"
+             "不静默回退",
+    )
     p.add_argument(
         "--selection-result",
         help="refit：阶段 1 的 selection_result.json；提供时 best_epoch "
@@ -713,12 +742,7 @@ def main(argv=None):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    if args.device == "auto":
-        device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
-    else:
-        device = torch.device(args.device)
+    device = resolve_device(args.device)
 
     if args.mode == "train":
         train(args, device)

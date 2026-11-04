@@ -66,6 +66,7 @@ from stock.inference.contracts import (
 )
 from stock.inference.predictor import score
 from stock.production import prediction_store, readiness
+from stock.training.runner import resolve_device
 from stock.selection.rules import hybrid_signal
 from stock.utils import sha256_file
 
@@ -95,7 +96,10 @@ def parse_args():
     p.add_argument("--top", type=int, default=10, help="终端展示条数")
     p.add_argument("--skip-export", action="store_true",
                    help="跳过 infer 导出，直接复用 infer-root 已有窗口")
-    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    p.add_argument("--device", choices=["auto", "cpu", "cuda"],
+                   default="cuda",
+                   help="默认 cuda；仅显式 --device cpu 才用 CPU；"
+                        "cuda 不可用时报错，不静默回退")
     p.add_argument("--max-lag-days", type=int, default=5,
                    help="发布门槛：as_of 距今天数上限")
     p.add_argument("--min-coverage", type=float, default=0.8,
@@ -204,10 +208,7 @@ def main():
     if min(args.workers, args.batch_size, args.top) < 1:
         raise ValueError("参数不合法")
 
-    device = torch.device(
-        "cuda" if (args.device == "auto" and torch.cuda.is_available())
-        else ("cuda" if args.device == "cuda" else "cpu")
-    )
+    device = resolve_device(args.device)
 
     checkpoint_path = resolve_path(args.checkpoint)
     checkpoint_sha = sha256_file(checkpoint_path)

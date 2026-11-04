@@ -131,7 +131,7 @@
         --min-train-samples 250 --min-eval-samples 20 \
         --export-workers 4 --epochs 30 --patience 5 \
         --batch-size 256 --loader-workers 0 \
-        --d-model 64 --e-layers 2 --patch-len 10 --device auto
+        --d-model 64 --e-layers 2 --patch-len 10 --device cuda
 
     # 两阶段协议（协议 B），rolling 对照（最近约三年训练标签）：
     # 增加 --train-days 732 --refit，并使用新的 --run-root
@@ -144,7 +144,7 @@
         --refit --refit-window-policy extend_to_val_end \
         --min-train-samples 250 --min-eval-samples 20 \
         --export-workers 4 --epochs 30 --patience 5 \
-        --batch-size 256 --loader-workers 0 --device auto
+        --batch-size 256 --loader-workers 2 --device cuda
 
     # 每折部分 PIT 股票池（选择按 A 时点、重拟合按 B 时点）：
     # 用 --pit-universe 替代 --universe-csv，并可调 --pit-top-mv 等
